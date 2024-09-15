@@ -29,7 +29,7 @@ class GraphVAE(nn.Module):
         u_S: latent representation of S (sensitive attribute), shape (latent_dim_S,1), sample by reparameterize from mu_S (latent_dim_S,1) and logvar_S (latent_dim_S,1)
         u_Y: latent representation of Y (graph information), shape (latent_dim_Y,1), sample by reparameterize from mu_Y (latent_dim_Y,1) and logvar_Y (latent_dim_Y,1)
     '''
-    def __init__(self, num_nodes, num_feats, latent_dim_S, latent_dim_Y, gcn_hidden_dim, device="cuda:2", pool="attention"):
+    def __init__(self, num_nodes, num_feats, latent_dim_S, latent_dim_Y, gcn_hidden_dim, num_labels, device="cuda:2", pool="attention"):
         super(GraphVAE, self).__init__()
         self.num_nodes = num_nodes
         self.num_feats = num_feats
@@ -38,6 +38,7 @@ class GraphVAE(nn.Module):
         self.device = torch.device(device)
         self.gcn_hidden_dim = gcn_hidden_dim
         self.pool = pool
+        self.num_labels = num_labels
 
 
         # u_S encoder
@@ -66,6 +67,13 @@ class GraphVAE(nn.Module):
         self.fc1_X= nn.Linear(latent_dim_S+latent_dim_Y, 512)
         self.fc2_X = nn.Linear(512, self.num_nodes* self.num_feats)
 
+        # Y decoder not using X and A:
+        self.fc1_Y = nn.Linear(latent_dim_Y, 512)
+        self.fc2_Y = nn.Linear(512, self.num_nodes * self.num_labels)
+        self.sigmoid = nn.Sigmoid()
+
+        # Y decoder using X and A
+        self.graph_conv3_Y = GraphConv(input_dim=self.num_feats + latent_dim_Y, output_dim=self.num_labels)
     def pool_graph(self, x):
         '''
         Pool graph representation from n*hidden_size to n
@@ -106,6 +114,28 @@ class GraphVAE(nn.Module):
         logvar_S = self.fc_logvar_S(x)
         u_S = self.reparameterize(mu_S, logvar_S)
         return mu_S, logvar_S, u_S
+
+    def encode_u_Y_using_Linear(self, X, A, Y):
+        '''
+        Traditional VAE or GraphVAE, which encode X,A,Y to learn the distribution of graph then predict X,A,Y for reconstruction using decode_X, decode_A and decode_Y
+        Args:
+            X: Nodes features, shape (n,k) where n is num_nodes, k is num_dimension
+            A: Adjacency Matrix, shape (n,n) but can be unsqueezed to (n*n) vector
+            Y: Node label, shape (n,1)
+
+        Returns:
+        '''
+        feat = torch.cat((X, Y), dim=1)
+        x = self.graph_conv1_Y(feat, A)
+        x = self.bn1_Y(x)
+        x = self.graph_conv2_Y(x, A)
+        x = self.bn2_Y(x)
+        x = self.relu(x)
+        x = self.pool_graph(x)
+        mu_Y = self.fc_mu_Y(x)
+        logvar_Y = self.fc_logvar_Y(x)
+        u_Y = self.reparameterize(mu_Y, logvar_Y)
+        return mu_Y, logvar_Y, u_Y
 
     def encode_u_Y(self, X, A, Y):
         '''
@@ -160,7 +190,7 @@ class GraphVAE(nn.Module):
         X = torch.matmul(torch.diag(A),X)
         return X
 
-    def decode_Y(self, u_Y, A, X):
+    def decode_Y_from_u_S_using_GCN(self, u_Y):
         '''
         Predict generated node label from u_Y (graph representation) and original A and X
         Args:
@@ -170,8 +200,26 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
+        Y = self.fc1_Y(u_Y)
+        Y = self.fc2_Y(Y)
+        Y = self.sigmoid(Y)
+        return Y
 
-        return None
+    def decode_Y_from_u_S_X_A(self, u_Y, A, X):
+        '''
+        Predict generated node label from u_Y (graph representation) and original A and X
+        Args:
+            X:
+            A:
+            u_Y:
+
+        Returns:
+        '''
+        u_Y = u_Y.view(1, len(u_Y))
+        X = torch.cat((X, u_Y*self.num_nodes), dim = 1)
+        Y = self.graph_conv3_Y(X, A)
+        Y = self.sigmoid(Y)
+        return Y
     def recover_adj_lower(self, l):
         # NOTE: Assumes 1 per minibatch
         #l: flatten vector of the upper triangular part of the adjacency matrix of a graph
