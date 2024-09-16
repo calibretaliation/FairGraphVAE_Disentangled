@@ -8,15 +8,17 @@ from torch import optim
 import torch.nn.functional as F
 import torch.nn.init as init
 import sys,os
+from torch_geometric.nn import GCNConv
 class GraphConv(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, device= "cuda:2"):
         super(GraphConv, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim).cuda())
+        self.device = torch.device(device)
+        self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim).to(self.device))
         # self.relu = nn.ReLU()
     def forward(self, x, adj):
-        y = torch.matmul(adj, x)
+        y = torch.matmul(adj, x).to(self.device)
         y = torch.matmul(y,self.weight)
         return y
 
@@ -35,45 +37,50 @@ class GraphVAE(nn.Module):
         self.num_feats = num_feats
         self.latent_dim_S = latent_dim_S
         self.latent_dim_Y = latent_dim_Y
-        self.device = torch.device(device)
+        self.device = device
         self.gcn_hidden_dim = gcn_hidden_dim
         self.pool = pool
         self.num_labels = num_labels
 
 
         # u_S encoder
-        self.graph_conv1_S = GraphConv(input_dim=num_feats, output_dim=self.gcn_hidden_dim)
-        self.bn1_S = nn.BatchNorm1d(num_feats)
-        self.graph_conv2_S = GraphConv(input_dim=self.gcn_hidden_dim, output_dim=self.gcn_hidden_dim)
-        self.bn2_S = nn.BatchNorm1d(num_feats)
-        self.fc_mu_S = nn.Linear(num_nodes, latent_dim_S)
-        self.fc_logvar_S = nn.Linear(num_nodes, latent_dim_S)
+        self.graph_conv1_S = GCNConv(in_channels=num_feats, out_channels=self.gcn_hidden_dim).to(self.device)
+        self.bn1_S = nn.BatchNorm1d(self.gcn_hidden_dim, device=torch.device(self.device))
+        self.graph_conv2_S = GCNConv(in_channels=self.gcn_hidden_dim, out_channels=self.gcn_hidden_dim).to(self.device)
+        self.bn2_S = nn.BatchNorm1d(self.gcn_hidden_dim, device=torch.device(self.device))
+        self.fc_mu_S = nn.Linear(num_nodes, latent_dim_S, device=torch.device(self.device))
+        self.fc_logvar_S = nn.Linear(num_nodes, latent_dim_S, device=torch.device(self.device))
 
         # u_Y encoder
-        self.graph_conv1_Y = GraphConv(input_dim=num_feats+1, output_dim=self.gcn_hidden_dim)
-        self.bn1_Y = nn.BatchNorm1d(num_feats+1)
-        self.graph_conv2_Y = GraphConv(input_dim=self.gcn_hidden_dim, output_dim=self.gcn_hidden_dim)
-        self.bn2_Y = nn.BatchNorm1d(num_feats+1)
-        self.fc_mu_Y = nn.Linear(num_nodes, latent_dim_Y)
-        self.fc_logvar_Y = nn.Linear(num_nodes, latent_dim_Y)
+        self.graph_conv1_Y = GCNConv(in_channels=num_feats+1, out_channels=self.gcn_hidden_dim).to(self.device)
+        self.bn1_Y = nn.BatchNorm1d(self.gcn_hidden_dim, device=torch.device(self.device))
+        self.graph_conv2_Y = GCNConv(in_channels=self.gcn_hidden_dim, out_channels=self.gcn_hidden_dim).to(self.device)
+        self.bn2_Y = nn.BatchNorm1d(self.gcn_hidden_dim, device=torch.device(self.device))
+        self.fc_mu_Y = nn.Linear(num_nodes, latent_dim_Y, device=torch.device(self.device))
+        self.fc_logvar_Y = nn.Linear(num_nodes, latent_dim_Y, device=torch.device(self.device))
         self.relu = nn.ReLU()
 
         #A decoder
         self.num_edges= self.num_nodes * (self.num_nodes + 1) // 2
-        self.fc1_A = nn.Linear(latent_dim_S+latent_dim_Y, 512)
-        self.fc2_A = nn.Linear(512, self.num_edges)
+        self.fc1_A = nn.Linear(latent_dim_S+latent_dim_Y, 512, device=torch.device(self.device))
+        self.fc2_A = nn.Linear(512, self.num_edges, device=torch.device(self.device))
 
         # X decoder
-        self.fc1_X= nn.Linear(latent_dim_S+latent_dim_Y, 512)
-        self.fc2_X = nn.Linear(512, self.num_nodes* self.num_feats)
+        self.gcn1_X= GCNConv(in_channels=latent_dim_S+latent_dim_Y, out_channels=512).to(self.device)
+        self.gcn2_X = GCNConv(in_channels=512, out_channels=self.num_nodes* self.num_feats).to(self.device)
 
         # Y decoder not using X and A:
-        self.fc1_Y = nn.Linear(latent_dim_Y, 512)
-        self.fc2_Y = nn.Linear(512, self.num_nodes * self.num_labels)
+        self.fc1_Y = nn.Linear(latent_dim_Y, 512, device=torch.device(self.device))
+        self.fc2_Y = nn.Linear(512, self.num_nodes * self.num_labels, device=torch.device(self.device))
         self.sigmoid = nn.Sigmoid()
 
         # Y decoder using X and A
-        self.graph_conv3_Y = GraphConv(input_dim=self.num_feats + latent_dim_Y, output_dim=self.num_labels)
+        self.graph_conv3_Y = GCNConv(in_channels=self.num_feats + latent_dim_Y, out_channels=512).to(self.device)
+        self.graph_conv4_Y = GCNConv(in_channels=512, out_channels=self.num_labels).to(self.device)
+
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
     def pool_graph(self, x):
         '''
         Pool graph representation from n*hidden_size to n
@@ -88,11 +95,11 @@ class GraphVAE(nn.Module):
         elif self.pool == 'sum':
             out = torch.sum(x, dim=1, keepdim=False)
         elif self.pool == 'attention':
-            attention_weights = torch.nn.Parameter(torch.randn(self.gcn_hidden_dim))
+            attention_weights = torch.nn.Parameter(torch.randn(self.gcn_hidden_dim)).to(torch.device(self.device))
             # Calculate attention scores and apply softmax
-            attention_scores = F.softmax(x @ attention_weights, dim=1)  # Shape: (n*, 1)
+            attention_scores = F.softmax(x @ attention_weights, dim=0)  # Shape: (n*, 1)
             # Multiply the attention scores by the original features to perform weighted sum pooling
-            out = (x * attention_scores.unsqueeze(-1)).sum(dim=1, keepdim=True)
+            out = (x * attention_scores).sum(dim=1, keepdim=True)
         return out
 
     def encode_u_S(self, X, A):
@@ -104,14 +111,15 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
-        x = self.graph_conv1_S(X, A)
+        edge_index = A.nonzero(as_tuple=False).t().to(self.device)
+        x = self.graph_conv1_S(abs(X), edge_index)
         x = self.bn1_S(x)
-        x = self.graph_conv2_S(x, A)
+        x = self.graph_conv2_S(abs(x), edge_index)
         x = self.bn2_S(x)
         x = self.relu(x)
         x = self.pool_graph(x)
-        mu_S = self.fc_mu_S(x)
-        logvar_S = self.fc_logvar_S(x)
+        mu_S = self.fc_mu_S(x.view((1,x.shape[0])))
+        logvar_S = self.fc_logvar_S(x.view((1,x.shape[0])))
         u_S = self.reparameterize(mu_S, logvar_S)
         return mu_S, logvar_S, u_S
 
@@ -125,10 +133,11 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
+        edge_index = A.nonzero(as_tuple=False).t().to(self.device)
         feat = torch.cat((X, Y), dim=1)
-        x = self.graph_conv1_Y(feat, A)
+        x = self.graph_conv1_Y(abs(feat), edge_index)
         x = self.bn1_Y(x)
-        x = self.graph_conv2_Y(x, A)
+        x = self.graph_conv2_Y(abs(x), edge_index)
         x = self.bn2_Y(x)
         x = self.relu(x)
         x = self.pool_graph(x)
@@ -147,15 +156,16 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
+        edge_index = A.nonzero(as_tuple=False).t().to(self.device)
         feat = torch.cat((X, Y), dim=1)
-        x = self.graph_conv1_Y(feat, A)
+        x = self.graph_conv1_Y(abs(feat), edge_index)
         x = self.bn1_Y(x)
-        x = self.graph_conv2_Y(x, A)
+        x = self.graph_conv2_Y(abs(x), edge_index)
         x = self.bn2_Y(x)
         x = self.relu(x)
         x = self.pool_graph(x)
-        mu_Y = self.fc_mu_Y(x)
-        logvar_Y = self.fc_logvar_Y(x)
+        mu_Y = self.fc_mu_Y(x.view((1,x.shape[0])))
+        logvar_Y = self.fc_logvar_Y(x.view((1,x.shape[0])))
         u_Y = self.reparameterize(mu_Y, logvar_Y)
         return mu_Y, logvar_Y, u_Y
 
@@ -168,7 +178,7 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
-        feat = torch.cat((u_S, u_Y), dim=0)
+        feat = torch.cat((u_S, u_Y), dim=1)
         l = self.fc1_A(feat)
         l = self.fc2_A(l)
         A = self.recover_adj_lower(l)
@@ -184,10 +194,11 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
-        feat = torch.cat((u_S, u_Y), dim=0)
-        X = self.fc1_A(feat)
-        X = self.fc2_A(X)
-        X = torch.matmul(torch.diag(A),X)
+        edge_index = A.nonzero(as_tuple=False).t().to(self.device)
+        latent = torch.cat((u_S, u_Y), dim=1)
+        feat = latent.repeat(self.num_nodes, 1)
+        X = self.gcn1_X(feat,edge_index)
+        X = self.gcn2_X(X, edge_index)
         return X
 
     def decode_Y_from_u_S_using_GCN(self, u_Y):
@@ -215,19 +226,21 @@ class GraphVAE(nn.Module):
 
         Returns:
         '''
-        u_Y = u_Y.view(1, len(u_Y))
-        X = torch.cat((X, u_Y*self.num_nodes), dim = 1)
-        Y = self.graph_conv3_Y(X, A)
+        edge_index = A.nonzero(as_tuple=False).t().to(self.device)
+        X = torch.cat((X, u_Y.repeat(self.num_nodes, 1)), dim = 1)
+        Y = self.graph_conv3_Y(abs(X), edge_index)
+        Y = self.graph_conv4_Y(Y, edge_index)
         Y = self.sigmoid(Y)
+
         return Y
     def recover_adj_lower(self, l):
         # NOTE: Assumes 1 per minibatch
         #l: flatten vector of the upper triangular part of the adjacency matrix of a graph
         #for example matrix 3x3: l =[a00, a01, a02, a11, a12, a22]
-        adj = torch.zeros(self.max_num_nodes, self.max_num_nodes) #adjacency matrix
+        adj = torch.zeros((self.num_nodes, self.num_nodes), device=torch.device(self.device)) #adjacency matrix
         # torch.triu: create upper triangular matrix filled with ones
         #adj[..] = 1: replace the ones with value of l
-        adj[torch.triu(torch.ones(self.max_num_nodes, self.max_num_nodes)) == 1] = l
+        adj[torch.triu(torch.ones(self.num_nodes, self.num_nodes)) == 1] = l
         return adj
     def loss_function(self):
         return None
@@ -243,5 +256,5 @@ class GraphVAE(nn.Module):
 
         A_new = self.decode_A(u_S, u_Y)
         X_new = self.decode_X(u_S, u_Y, A_new)
-        Y_new = self.decode_Y(u_Y, A, X)
+        Y_new = self.decode_Y_from_u_S_X_A(u_Y, A, X)
         return X_new, A_new, Y_new
