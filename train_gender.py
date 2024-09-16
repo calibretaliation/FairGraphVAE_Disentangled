@@ -306,8 +306,6 @@ def train():
     
     gender_recon_loss = criterion1(gender_probabilities, sens[data.train_mask].float())
 
-
-    
     criterion2 = torch.nn.BCEWithLogitsLoss()
     logits_label = logits_label[data.train_mask].to(device)
     label_loss = criterion2(logits_label.squeeze(dim=1), labels[data.train_mask].float())

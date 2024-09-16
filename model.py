@@ -9,6 +9,14 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import sys,os
 from torch_geometric.nn import GCNConv
+
+from config import Config
+from data import generate_sample_graph
+
+
+def loss_function(X_new, A_new, Y_new, X, A, Y):
+    return None
+
 class GraphConv(nn.Module):
     def __init__(self, input_dim, output_dim, device= "cuda:2"):
         super(GraphConv, self).__init__()
@@ -242,8 +250,6 @@ class GraphVAE(nn.Module):
         #adj[..] = 1: replace the ones with value of l
         adj[torch.triu(torch.ones(self.num_nodes, self.num_nodes)) == 1] = l
         return adj
-    def loss_function(self):
-        return None
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -258,3 +264,23 @@ class GraphVAE(nn.Module):
         X_new = self.decode_X(u_S, u_Y, A_new)
         Y_new = self.decode_Y_from_u_S_X_A(u_Y, A, X)
         return X_new, A_new, Y_new
+
+def run_model_debug(config: Config):
+    num_nodes = config.num_nodes
+    num_feats = config.num_feats
+    num_labels = config.num_labels
+    # Instantiate the ConvVAE model
+    model = GraphVAE(num_nodes=config.num_nodes,
+                     num_feats=config.num_feats,
+                     latent_dim_S=config.latent_dim_S,
+                     latent_dim_Y=config.latent_dim_Y,
+                     gcn_hidden_dim=config.gcn_hidden_dim,
+                     num_labels=config.num_labels,
+                     device=config.device,
+                     pool=config.pool)
+
+    # Create the sample input
+    X, A, Y = generate_sample_graph(num_nodes, num_feats, num_labels)
+
+    # Run one forward pass through the model
+    X_new, A_new, Y_new = model(X, A, Y)
