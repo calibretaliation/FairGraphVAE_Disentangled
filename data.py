@@ -1,122 +1,107 @@
-from scipy.io import loadmat
-
+from scipy.io import loadmat, savemat
+from torch.utils.data import random_split
+from torch_geometric.data import InMemoryDataset, Data
+import os, sys
 from config import Config
 import torch
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
 
 def generate_sample_graph(num_nodes, num_feats, num_labels):
     X = np.random.rand(num_nodes, num_feats)
     normalized_X = X / np.linalg.norm(X, axis=1, keepdims=True)
     X = torch.tensor(normalized_X, dtype=torch.float32)
-    Y = torch.tensor(np.random.randint(num_labels+1, size=(num_nodes, 1)))
+    Y = torch.tensor(np.random.randint(num_labels, size=(num_nodes, 1)), dtype = torch.float32)
     upper_tri = np.triu(np.random.randint(2, size=(num_nodes, num_nodes)), 1)
     A = upper_tri + upper_tri.T
     for i in range(num_nodes):
         A[i, i] = 1
     A = torch.tensor(A, dtype=torch.float32)
     return X, A, Y
-
+def save_graphs(data, path, format):
+    if format == "mat":
+        savemat(data,path)
+    elif format == "pt":
+        torch.save(data,path)
 def read_graphs(path, type = "mat"):
     if type == "mat":
         data = loadmat(path)
-class GraphDataset(Dataset):
-    def __init__(self, graph_data):
-        """
-        Args:
-            graph_data (list): A list of tuples, where each tuple represents a graph.
-                               Each tuple contains:
-                               - adjacency matrix (torch.Tensor of shape (n, n))
-                               - node features (torch.Tensor of shape (n, k))
-                               - node labels (torch.Tensor of shape (n, 1))
-        """
-        self.graph_data = graph_data
 
-    def __len__(self):
-        return len(self.graph_data)
+    elif type == "pt":
+        data = torch.load(path)
 
-    def __getitem__(self, idx):
-        return self.graph_data[idx]
+    return data
+class GeneratedDataset(InMemoryDataset):
+    def __init__(self, root, transform=None, pre_transform=None):
+        super(GeneratedDataset, self).__init__(root, transform, pre_transform)
+        self.data, self.slices = torch.load(self.processed_paths[0])
 
+    @property
+    def raw_file_names(self):
+        # 返回原始数据文件名列表
+        return ['generate.pt']
 
-class GraphDataset(Dataset):
-    def __init__(self, graph_data):
-        """
-        Args:
-            graph_data (list): A list of tuples, where each tuple represents a graph.
-                               Each tuple contains:
-                               - adjacency matrix (torch.Tensor of shape (n, n))
-                               - node features (torch.Tensor of shape (n, k))
-                               - node labels (torch.Tensor of shape (n, 1))
-        """
-        self.graph_data = graph_data
+    @property
+    def processed_file_names(self):
+        # 返回处理后的数据文件名列表
+        return ['processed_generated_graph.pt']
 
-    def __len__(self):
-        return len(self.graph_data)
+    def download(self):
+        # 下载数据，如果需要的话
+        pass
 
-    def __getitem__(self, idx):
-        return self.graph_data[idx]
+    def process(self):
+        # Here you load your data and convert it into a Data object
+        data_list = []
+        for raw_path in self.raw_paths:
+            # Load raw data, e.g. from a .pt file
+            all_data = read_graphs(raw_path, "pt")
+            for graph in all_data:
+                data = Data(x=graph['X'], edge_index=graph['edge_index'], y=graph['Y'])
+                if self.pre_transform is not None:
+                    data = self.pre_transform(data)
+                data_list.append(data)
 
-def collate_graphs(batch):
-    """
-    Custom collate function to handle variable-sized graphs and create a batch.
+        if self.pre_filter is not None:
+            data_list = [data for data in data_list if self.pre_filter(data)]
 
-    Args:
-        batch (list): A list of tuples, where each tuple contains:
-                      - adjacency matrix of shape (n, n)
-                      - node features of shape (n, k)
-                      - node labels of shape (n, 1)
-
-    Returns:
-        A batch of adjacency matrices, node features, and node labels, all padded to the
-        size of the largest graph in the batch.
-    """
-    # Find the largest number of nodes in the batch
-    max_num_nodes = max([graph[0].size(0) for graph in batch])
-
-    adj_matrices = []
-    node_features = []
-    node_labels = []
-
-    for adj_matrix, features, labels in batch:
-        n = adj_matrix.size(0)  # Number of nodes in the graph
-
-        # Pad adjacency matrix to (max_num_nodes, max_num_nodes)
-        padded_adj_matrix = F.pad(adj_matrix, (0, max_num_nodes - n, 0, max_num_nodes - n))
-        adj_matrices.append(padded_adj_matrix)
-
-        # Pad node features to (max_num_nodes, k)
-        padded_features = F.pad(features, (0, 0, 0, max_num_nodes - n))
-        node_features.append(padded_features)
-
-        # Pad node labels to (max_num_nodes, 1)
-        padded_labels = F.pad(labels, (0, 0, 0, max_num_nodes - n))
-        node_labels.append(padded_labels)
-
-    # Stack all the padded tensors to create batch
-    adj_matrices = torch.stack(adj_matrices, dim=0)
-    node_features = torch.stack(node_features, dim=0)
-    node_labels = torch.stack(node_labels, dim=0)
-
-    return adj_matrices, node_features, node_labels
+        # 将数据存储到磁盘上
+        data, slices = self.collate(data_list)
+        torch.save((data, slices), self.processed_paths[0])
 
 
 def load_dataset(config: Config, dataset = "generate"):
     assert dataset in ['generate'], \
     "dataset parameter should be one of: ['generate']"
     if dataset == "generate":
-        graph_list = []
-        for i in range(1000):
-            graph_list.append((generate_sample_graph(config.num_nodes, config.num_feats, config.num_labels)))
-        dataset = GraphDataset(graph_list)
-        data_loader = DataLoader(dataset, batch_size=config.batch_size, collate_fn=collate_graphs)
+        if os.path.isfile(config.data_path + "/raw/{}.pt".format(dataset)) and os.path.getsize(config.data_path + "/raw/{}.pt".format(dataset)) < 0:
+            pass
+        else:
+            graph_list = []
+            for i in range(100):
+                graph = {}
+                X,A,Y = generate_sample_graph(config.num_nodes, config.num_feats, config.num_labels)
+                graph['X'] = X
+                graph['edge_index'] = torch.nonzero(A, as_tuple=False).t()
+                graph['Y'] = Y
+                graph_list.append(graph)
+            save_graphs(graph_list, config.data_path + "/raw/{}.pt".format(dataset), "pt")
+        dataset = GeneratedDataset(root=config.data_path)
+        return dataset
+def split_data_train_val(dataset, config):
+    train_size = int(config.train_size * len(dataset))  # 80% for training
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader([dataset[i] for i in train_dataset.indices], shuffle=True)
+    val_loader = DataLoader([dataset[i] for i in val_dataset.indices], shuffle=False)
+    return train_loader, val_loader
+def construct_A_from_edge_index(edge_index, num_nodes):
+    # Initialize an empty adjacency matrix
+    adj_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.float)
 
-        return data_loader
-dataset = load_dataset(Config(), "generate")
-for id, (A,X,Y) in enumerate(dataset):
-    print("Adjacency Matrices:", A.shape)
-    print("Node Features:", X.shape)
-    print("Node Labels:", Y.shape)
-    break
+    # Set matrix entries corresponding to edges in the edge_index
+    adj_matrix[edge_index[0], edge_index[1]] = 1
+
+    return adj_matrix
