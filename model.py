@@ -106,7 +106,7 @@ class GraphVAE(nn.Module):
             # Calculate attention scores and apply softmax
             attention_scores = F.softmax(x @ attention_weights, dim=0)  # Shape: (n*, 1)
             # Multiply the attention scores by the original features to perform weighted sum pooling
-            out = (x * attention_scores).sum(dim=1, keepdim=True)
+            out = (x * attention_scores[:, np.newaxis]).sum(dim=1, keepdim=True)
         return out
 
     def encode_u_S(self, X, edge_index):
