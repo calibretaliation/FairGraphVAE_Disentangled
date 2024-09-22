@@ -42,12 +42,13 @@ class S_decoder(nn.Module):
         super(S_decoder, self).__init__()
         self.gconv1_S = GCNConv(in_channels=config.latent_dim_S, out_channels=config.gcn_hidden_dim).to(config.device)
         self.gconv2_S = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.num_sensitive_class).to(config.device)
-        self.softmax = nn.Softmax()
+        self.sigmoid = nn.Sigmoid()
     def forward(self, x, edge_index):
 
         x = self.gconv1_S(x, edge_index).relu()
         x = self.gconv2_S(x, edge_index).relu()
-        return self.softmax(x, dim=1)
+        return self.sigmoid(x)
+
 class A_decoder(nn.Module):
     def __init__(self, config):
         super(A_decoder, self).__init__()
@@ -76,7 +77,19 @@ class X_decoder(nn.Module):
         X = self.gconv1_X(latent, edge_index)
         X = self.gconv2_X(X, edge_index)
         return X
+class Y_prime_decoder(nn.Module):
+    def __init__(self, config):
+        super(Y_prime_decoder, self).__init__()
+        self.gconv1_Y_prime = GCNConv(in_channels=config.num_feats, out_channels=512).to(config.device)
+        self.gconv2_Y_prime = GCNConv(in_channels=512, out_channels=config.num_labels).to(config.device)
+        self.softmax = nn.Softmax()
 
+    def forward(self, X, edge_index):
+        Y_prime= self.gconv1_Y_prime(X, edge_index)
+        Y_prime = self.gconv2_Y_prime(Y_prime, edge_index)
+        Y_prime = self.softmax(Y_prime)
+
+        return Y_prime
 class Y_decoder(nn.Module):
     def __init__(self, config):
         super(Y_decoder, self).__init__()
@@ -109,6 +122,8 @@ class GraphVAE(nn.Module):
         self.X_decoder = X_decoder(config)
         self.A_decoder = A_decoder(config)
         self.Y_decoder = Y_decoder(config)
+        self.Y_prime_decoder = Y_prime_decoder(config)
+        self.S_decoder = S_decoder(config)
         self.bce_loss = nn.BCEWithLogitsLoss()
 
         for m in self.modules():
@@ -125,6 +140,34 @@ class GraphVAE(nn.Module):
         eps = torch.randn_like(std)
         return eps.mul(std).add_(mu)
 
+    def S_recon_loss(self, S_hat):
+        p_s1 = S_hat
+        p_s0 = 1 - S_hat
+
+        # Compute the entropy loss
+        entropy_loss = - torch.sum(p_s1 * torch.log(p_s1) + p_s0 * torch.log(p_s0))
+
+        return entropy_loss
+
+    def efl(self, S_hat, Y_pred):
+        p_s1 = S_hat
+        p_s0 = 1 - S_hat
+
+        sum_s_1 = torch.sum(p_s1 * Y_pred)  # Sum of positive outcomes for Ŝi = 1 group
+        sum_s_0 = torch.sum(p_s0 * Y_pred)  # Sum of positive outcomes for Ŝi = 0 group
+
+        # Normalization terms (the sum of probabilities for each group)
+        norm_s_1 = torch.sum(p_s1)
+        norm_s_0 = torch.sum(p_s0)
+
+        # Calculate the weighted average of positive outcomes for each group
+        avg_s_1 = sum_s_1 / norm_s_1  # Average for Ŝi = 1 group
+        avg_s_0 = sum_s_0 / norm_s_0  # Average for Ŝi = 0 group
+
+        # Compute the Estimated Fairness Loss (EFL)
+        efl = avg_s_1 - avg_s_0
+
+        return efl
     def hgr_correlation(self, X, Y, n_components=10):
         """
         计算Hirschfeld-Gebelein-Rényi (HGR) 相关性
@@ -167,7 +210,7 @@ class GraphVAE(nn.Module):
     def loss_function(self, X_pred,
                       Y_pred,
                       X_true,
-                      Y_true,
+                      Y_prime,
                       logvar_u_Y,
                       mu_u_Y,
                       logvar_u_S,
@@ -175,11 +218,15 @@ class GraphVAE(nn.Module):
                       edge_index,
                       l,
                       u_S,
-                      u_Y):
+                      u_Y,
+                      S_hat):
 
-        labels = (Y_pred > 0.5).float()
-        Y_pred = labels.argmax(dim=1).unsqueeze(1)
-        Y_recon_loss = F.cross_entropy(Y_pred.float(), Y_true.float())
+        S_recon_loss = self.S_recon_loss(S_hat)
+        prediction = (Y_pred > 0.5).float()
+        labels = (Y_prime > 0.5).float()
+        Y_pred = prediction.argmax(dim=1).unsqueeze(1)
+        Y_prime = labels.argmax(dim=1).unsqueeze(1)
+        Y_recon_loss = F.cross_entropy(Y_pred.float(), Y_prime.float())
 
         # 2. Reconstruction Loss for X (log P(X | U_S, A, U_Y))
         X_recon_loss = F.mse_loss(X_pred.float(), X_true.float())
@@ -192,12 +239,13 @@ class GraphVAE(nn.Module):
         # 5. KL Divergence for U_S (KL(Q(U_S | X, A) || P(U_S)))
         kl_u_s = -0.5 * torch.sum(1 + logvar_u_S - mu_u_S.pow(2) - logvar_u_S.exp())
 
+        efl_term = self.efl(S_hat, Y_pred)
         # 6. HGR Regularization Term (lambda * HGR(U_S, Y))
         hgr_term = self.config.lambda_hgr * self.hgr_correlation(u_S, u_Y)
 
         # ELBO is the sum of all these terms
         elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + kl_u_y + kl_u_s
-                + hgr_term
+                + hgr_term + efl_term + S_recon_loss
                 )
 
         return elbo
@@ -207,11 +255,14 @@ class GraphVAE(nn.Module):
         mu_Y, logvar_Y = self.u_Y_encoder(X,edge_index,Y)
         u_S = self.reparameterize(mu_S,logvar_S)
         u_Y = self.reparameterize(mu_Y,logvar_Y)
-
+        S_hat = self.S_decoder(u_S, edge_index).detach()
+        Y_prime = self.Y_prime_decoder(X,edge_index)
         A_new, l = self.A_decoder(u_S, u_Y)
         X_new = self.X_decoder(edge_index, u_S, u_Y)
-        Y_new = self.Y_decoder(edge_index, u_Y, X)
-        return self.loss_function(X_new, Y_new, X, Y , logvar_Y, mu_Y, logvar_S, mu_S, edge_index, l, u_S, u_Y), Y_new
+        Y_new = self.Y_decoder(edge_index, u_Y, X).detach()
+        return (self.loss_function(X_new, Y_new, X, Y_prime , logvar_Y, mu_Y, logvar_S, mu_S, edge_index, l, u_S, u_Y, S_hat),
+                Y_new,
+                S_hat)
 
 def run_model_debug(config: Config):
     num_nodes = config.num_nodes
@@ -225,4 +276,4 @@ def run_model_debug(config: Config):
     edge_index = torch.nonzero(A, as_tuple=False).t()
 
     # Run one forward pass through the model
-    loss, Y_new= model(X.to(config.device), edge_index.to(config.device), Y.to(config.device))
+    loss, Y_new, S_hat = model(X.to(config.device), edge_index.to(config.device), Y.to(config.device))
