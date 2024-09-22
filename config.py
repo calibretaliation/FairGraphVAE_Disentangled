@@ -4,6 +4,7 @@ class Config():
         # Model config
         self.num_nodes = 5
         self.num_feats = 3
+        self.num_sensitive_class = 2
         self.latent_dim_S = 128
         self.latent_dim_Y = 128
         self.gcn_hidden_dim = 512
@@ -20,3 +21,4 @@ class Config():
         self.LR_milestones = [500, 1000]
         self.train_epoch = 500
         self.log_epoch = 10
+        self.lambda_hgr = 0.25

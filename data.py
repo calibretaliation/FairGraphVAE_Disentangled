@@ -105,3 +105,19 @@ def construct_A_from_edge_index(edge_index, num_nodes):
     adj_matrix[edge_index[0], edge_index[1]] = 1
 
     return adj_matrix
+def recover_adj_lower(l, config):
+    # NOTE: Assumes 1 per minibatch
+    #l: flatten vector of the upper triangular part of the adjacency matrix of a graph
+    #for example matrix 3x3: l =[a00, a01, a02, a11, a12, a22]
+    adj_matrix = torch.zeros((config.num_nodes, config.num_nodes), device=torch.device(config.device)) #adjacency matrix
+
+
+    # Step 3: Fill the upper triangular part of the adjacency matrix (excluding the diagonal)
+    upper_tri_indices = torch.triu_indices(config.num_nodes, config.num_nodes, offset=0)  # Indices for the upper triangular part
+    adj_matrix[upper_tri_indices[0], upper_tri_indices[1]] = l
+
+    # Step 4: Copy the upper triangular part to the lower triangular part to ensure symmetry
+    adj_matrix = adj_matrix + adj_matrix.T
+    adj_matrix = torch.where(adj_matrix >= 0.5, torch.tensor(1.0), torch.tensor(0.0))
+
+    return adj_matrix
