@@ -22,3 +22,4 @@ class Config():
         self.train_epoch = 500
         self.log_epoch = 10
         self.lambda_hgr = 0.25
+        self.efl_gamma =0.25

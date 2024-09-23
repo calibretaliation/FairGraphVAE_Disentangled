@@ -168,45 +168,7 @@ class GraphVAE(nn.Module):
         efl = avg_s_1 - avg_s_0
 
         return efl
-    def hgr_correlation(self, X, Y, n_components=10):
-        """
-        计算Hirschfeld-Gebelein-Rényi (HGR) 相关性
 
-        参数:
-        X: 第一个随机变量，numpy数组或 torch.Tensor
-        Y: 第二个随机变量，numpy数组或 torch.Tensor
-        n_components: 使用的主成分数量
-
-        返回:
-        HGR相关性
-        """
-        # 确保 X 和 Y 都是张量
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).to(self.config)
-        if isinstance(Y, np.ndarray):
-            Y = torch.from_numpy(Y).to(self.config)
-        # 创建张量的副本
-        X_copy = X.clone().detach().cpu().numpy()
-        Y_copy = Y.clone().detach().cpu().numpy()
-        num_samples = 1000
-
-        # 数据中心化
-        X_centered = X_copy - np.mean(X_copy)
-        Y_centered = Y_copy - np.mean(Y_copy)
-        X_centered = X_centered[:num_samples, :]
-        Y_centered = Y_centered[:num_samples, :]
-        # 计算协方差矩阵
-        C = np.cov(X_centered, Y_centered)
-        # 奇异值分解
-        S, U = eigh(C)
-
-        # 选择前n_components个主成分
-        S = S[-n_components:]
-        # 计算HGR相关性
-        hgr = np.sum(S) / (np.std(X_centered) * np.std(Y_centered))
-
-        # 返回结果
-        return hgr
     def loss_function(self, X_pred,
                       Y_pred,
                       X_true,
@@ -239,9 +201,9 @@ class GraphVAE(nn.Module):
         # 5. KL Divergence for U_S (KL(Q(U_S | X, A) || P(U_S)))
         kl_u_s = -0.5 * torch.sum(1 + logvar_u_S - mu_u_S.pow(2) - logvar_u_S.exp())
 
-        efl_term = self.efl(S_hat, Y_pred)
+        efl_term = -self.config.efl_gamma*self.efl(S_hat, Y_pred)
         # 6. HGR Regularization Term (lambda * HGR(U_S, Y))
-        hgr_term = self.config.lambda_hgr * self.hgr_correlation(u_S, u_Y)
+        hgr_term = -self.config.lambda_hgr * hgr_correlation(u_S, u_Y)
 
         # ELBO is the sum of all these terms
         elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + kl_u_y + kl_u_s
@@ -262,7 +224,36 @@ class GraphVAE(nn.Module):
         Y_new = self.Y_decoder(edge_index, u_Y, X).detach()
         return (self.loss_function(X_new, Y_new, X, Y_prime , logvar_Y, mu_Y, logvar_S, mu_S, edge_index, l, u_S, u_Y, S_hat),
                 Y_new,
-                S_hat)
+                S_hat,
+                u_S)
+class F_1_U_S(nn.Module):
+    '''
+    Notations:
+        X: Nodes features, shape (n,k) where n is num_nodes, k is num_dimension
+        A: Adjacency Matrix, shape (n,n) but can be unsqueeze to (n*n) vector
+        Y: Node label, shape (n,1)
+        u_S: latent representation of S (sensitive attribute), shape (latent_dim_S,1), sample by reparameterize from mu_S (latent_dim_S,1) and logvar_S (latent_dim_S,1)
+        u_Y: latent representation of Y (graph information), shape (latent_dim_Y,1), sample by reparameterize from mu_Y (latent_dim_Y,1) and logvar_Y (latent_dim_Y,1)
+    '''
+    def __init__(self, config):
+        super(F_1_U_S, self).__init__()
+        self.config = config
+        self.fc_1 = nn.Linear(config.latent_dim_S, 512).to(config.device)
+        self.fc_2 = nn.Linear(512, 128).to(config.device)
+    def forward(self, S):
+        S = torch.relu(self.fc_1(S))
+        return self.fc_2(S)
+
+class F_2_Y(nn.Module):
+    def __init__(self, config):
+        super(F_2_Y, self).__init__()
+        self.config = config
+        self.fc_1 = nn.Linear(1, 512).to(config.device)
+        self.fc_2 = nn.Linear(512, 128).to(config.device)
+    def forward(self, Y):
+        Y = torch.relu(self.fc_1(Y))
+        return self.fc_2(Y)
+
 
 def run_model_debug(config: Config):
     num_nodes = config.num_nodes
@@ -276,4 +267,24 @@ def run_model_debug(config: Config):
     edge_index = torch.nonzero(A, as_tuple=False).t()
 
     # Run one forward pass through the model
-    loss, Y_new, S_hat = model(X.to(config.device), edge_index.to(config.device), Y.to(config.device))
+    loss, Y_new, S_hat, u_S = model(X.to(config.device), edge_index.to(config.device), Y.to(config.device))
+def hgr_correlation(X, Y, n_components=10):
+    assert X.shape[0] == Y.shape[0], "X and Y must have the same number of samples"
+
+    # Center the data (remove mean)
+    X_centered = X - torch.mean(X, dim=0)
+    Y_centered = Y - torch.mean(Y, dim=0)
+
+    # Covariance matrix approximation
+    C = torch.matmul(X_centered.T, Y_centered) / X_centered.shape[0]  # Covariance matrix
+
+    # Singular Value Decomposition (SVD) to get the principal components
+    U, S, V = torch.svd(C)
+
+    # Select the top `n_components` singular values
+    S_top = S[:n_components]
+
+    # Compute the HGR correlation as the sum of the top components divided by the product of std deviations
+    hgr = torch.sum(S_top) / (torch.std(X_centered) * torch.std(Y_centered) + 1e-8)  # Add epsilon for stability
+
+    return hgr
