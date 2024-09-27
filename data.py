@@ -1,3 +1,4 @@
+import pandas as pd
 from scipy.io import loadmat, savemat
 from sklearn.model_selection import train_test_split
 from torch.utils.data import random_split
@@ -148,13 +149,61 @@ def load_nba_data(config):
     config.num_feats = len(feature)
     config.num_sensitive_class = len(nba_sensitive_dict)
     config.num_labels = len(nba_label_dict)
+    config.dataset_name = "nba"
+
     save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name,dataset_name), "pt")
     result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
     return result
 
+def load_german_data(config):
+    dataset_name = "german"
+    dataset_name = "german"
+    data = pd.read_csv(config.data_path + "/{}".format(dataset_name) + "/german.csv")
+
+    # Step 1: Transform 'Gender' to binary (1 for 'Male', 0 for 'Female')
+    data['Gender'] = data['Gender'].map({'Male': 1, 'Female': 0})
+
+    # Step 2: One-hot encode 'PurposeOfLoan' as it has multiple categories
+    data = pd.get_dummies(data, columns=['PurposeOfLoan'], drop_first=True)
+
+    german_label = data['GoodCustomer'].values.astype(np.float32).reshape(-1, 1)
+    # Extract sensitive matrix from 'Gender' column
+    german_sensitive = data['Gender'].values.astype(np.float32).reshape(-1, 1)
+    # Drop 'GoodCustomer' and 'Gender' to create feature matrix
+    feature_columns = data.drop(columns=['GoodCustomer', 'Gender'])
+      # Convert to matrix form
+    feature_columns = feature_columns.apply(pd.to_numeric, errors='coerce')
+    german_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(german_node_feature), len(german_node_feature)))
+    for i in range(len(network)):
+        network[i, i] = 1
+    with open(config.data_path + "/{}".format(dataset_name) + "/german_edges.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split(' ')))
+            network[line[0], line[1]] = 1
+            network[line[1], line[0]] = 1
+            line = file.readline()
+    print(german_node_feature)
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(german_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(german_node_feature)
+)
+    dataset["S"] = min_max_scale_features(torch.tensor(german_sensitive))
+    config.num_nodes = german_node_feature.shape[0]
+    config.num_feats = german_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(german_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "german"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    return result
+
 def load_dataset(config: Config, dataset = "nba"):
-    assert dataset in ['generate','nba'], \
-    "dataset parameter should be one of: ['generate','nba']"
+    assert dataset in ['generate','nba','german'], \
+    "dataset parameter should be one of: ['generate','nba','german']"
     if not os.path.exists(config.data_path + "/{}/raw".format(dataset)):
         os.mkdir(config.data_path + "/{}/raw".format(dataset))
 
@@ -172,10 +221,11 @@ def load_dataset(config: Config, dataset = "nba"):
             graph_list.append(graph)
         save_graphs(graph_list, config.data_path + "/{}/raw/{}.pt".format(dataset, dataset), "pt")
         dataset = GraphDataset(root=config.data_path + "/{}".format(dataset), dataset_name=dataset)
-        return dataset
     elif dataset == "nba":
         dataset = load_nba_data(config)
-        return dataset
+    elif dataset == "german":
+        dataset = load_german_data(config)
+    return dataset
 def split_data_train_val(dataset, config):
     train_size = int(config.train_size * len(dataset))  # 80% for training
     val_size = len(dataset) - train_size

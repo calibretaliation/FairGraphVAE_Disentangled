@@ -86,25 +86,25 @@ class Y_prime_decoder(nn.Module):
     def __init__(self, config):
         super(Y_prime_decoder, self).__init__()
         self.gconv1_Y_prime = GCNConv(in_channels=config.num_feats, out_channels=512).to(config.device)
-        self.gconv2_Y_prime = GCNConv(in_channels=512, out_channels=config.num_labels).to(config.device)
-
+        self.gconv2_Y_prime = GCNConv(in_channels=512, out_channels=2).to(config.device)
+        self.softmax = nn.Softmax()
     def forward(self, X, edge_index):
         Y_prime = self.gconv1_Y_prime(X, edge_index).relu()
         Y_prime = self.gconv2_Y_prime(Y_prime, edge_index)
 
-        return Y_prime
+        return self.softmax(Y_prime)
 class Y_decoder(nn.Module):
     def __init__(self, config):
         super(Y_decoder, self).__init__()
         self.gconv1_Y = GCNConv(in_channels=config.num_feats + config.latent_dim_Y, out_channels=512).to(config.device)
-        self.gconv2_Y = GCNConv(in_channels=512, out_channels=config.num_labels).to(config.device)
-
+        self.gconv2_Y = GCNConv(in_channels=512, out_channels=2).to(config.device)
+        self.softmax = nn.Softmax()
     def forward(self, edge_index, X, u_Y):
         latent = torch.cat((u_Y, X), dim=1)
         Y = self.gconv1_Y(latent, edge_index).relu()
         Y = self.gconv2_Y(Y, edge_index)
 
-        return Y
+        return self.softmax(Y)
 class GraphVAE(nn.Module):
     '''
     Notations:
@@ -159,12 +159,13 @@ class GraphVAE(nn.Module):
 
 
         # S_recon_loss = self.S_recon_loss(S_hat)
-        Y_pred, _ = torch.max(Y_pred[idx], dim=1, keepdim=True)
-        Y_prime, _ = torch.max(Y_prime[idx], dim=1, keepdim=True)
-
+        # Y_pred, _ = torch.max(Y_pred[idx], dim=1, keepdim=True)
+        # Y_prime, _ = torch.max(Y_prime[idx], dim=1, keepdim=True)
+        Y_true[Y_true != 1] = 0
+        Y_true = torch.nn.functional.one_hot(Y_true.long(), num_classes=2).squeeze()
         # Y_prime = Y_prime.argmax(dim=1).unsqueeze(1)[idx]
-        Y_recon_loss = abs(nn.MSELoss()(Y_pred.float(), Y_true[idx].float())
-                        + nn.MSELoss()(Y_pred.float(), Y_prime.float())
+        Y_recon_loss = abs(nn.MSELoss()(Y_pred[idx].float(), Y_true[idx].float())
+                        + nn.MSELoss()(Y_pred[idx].float(), Y_prime[idx].float())
                         )
 
         # 2. Reconstruction Loss for X (log P(X | U_S, A, U_Y))

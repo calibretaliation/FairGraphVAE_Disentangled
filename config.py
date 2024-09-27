@@ -11,7 +11,7 @@ class Config():
         self.gcn_hidden_dim = 512
         self.device = 'cuda:0'
         self.pool = "attention"
-
+        self.dataset_name = "nba"
         #Data config
         self.batch_size = 10
         self.train_size = 0.75
@@ -21,5 +21,5 @@ class Config():
         self.LR_milestones = [500, 1000]
         self.train_epoch = 10001
         self.log_epoch = 10
-        self.lambda_hgr = 1e2
-        self.efl_gamma =1e2
+        self.lambda_hgr = 1e4
+        self.efl_gamma =1e4

@@ -17,21 +17,31 @@ import matplotlib.pyplot as plt
 
 def evaluate(model, val_idx, config, data, S_true, S_idx):
     all_preds = []
-    all_y = []
     X = data.x.float()
     edge_index = data.edge_index.int()
-    Y = data.y.to(config.device)
+    Y = data.y.to(config.device).long()
+    Y[Y != 1] = 0
     X = Variable(X).to(config.device)
     edge_index = Variable(edge_index).to(config.device)
     loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term, Y_new, u_S = model(X,edge_index,Y, val_idx)
-    predicted = Y_new.float().argmax(dim=1).unsqueeze(1)
-    all_preds.extend(predicted.cpu().numpy())
-    all_y.extend(np.array([0 if i[0] else 1 for i in Y.cpu().numpy()]))
+    # predicted = (Y_new > 0.5).float()
+    all_preds = Y_new.data.argmax(dim=1).cpu().numpy()
+    all_y = Y.squeeze().cpu().numpy()
+    print(np.unique(all_y, return_counts=True))
+    print(np.unique(all_preds, return_counts=True))
     score = accuracy_score(all_y, all_preds)
-    predicted[predicted != 1] = 0
-    Y[Y != 1] = 0
-    spd = get_counts(predicted[S_idx].squeeze().cpu().numpy(), Y[S_idx].squeeze().cpu().numpy(), S_true.squeeze().cpu().numpy(), )
-    return score, spd
+    spd = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), )
+    aod = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "aod")
+    eod = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "eod")
+    recall = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "recall")
+    far = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "far")
+    precision = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "precision")
+    accuracy = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "accuracy")
+    F1 = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "F1")
+    TPR = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "TPR")
+    FPR = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "FPR")
+    DI = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "DI")
+    return score, spd, aod, eod, recall, far, precision, accuracy, F1, TPR, FPR, DI
 
 def train(config: Config, train_idx, val_idx, graph):
     model = GraphVAE(config).to(config.device)
@@ -61,7 +71,20 @@ def train(config: Config, train_idx, val_idx, graph):
                 "kl_u_y":[],
                 "kl_u_s":[],
                 "hgr_term_min_phase":[],
-                "max_phase_loss":[]}
+                "max_phase_loss":[],
+                 "val_accuracy":[],
+                 "spd":[],
+                 'aod':[],
+                 'eod':[],
+                 'recall':[],
+                 'far':[],
+                 'precision':[],
+                 'accuracy':[],
+                 'F1':[],
+                 'TPR':[],
+                 'FPR':[],
+                 "DI":[]
+                 }
     val_acc_max = 70
     spd_min = 1e8
     X = graph.x.float()
@@ -79,7 +102,7 @@ def train(config: Config, train_idx, val_idx, graph):
         Y_pred = Y_pred.argmax(dim=1).unsqueeze(1)[train_idx]
         S_hat = S_classifier(u_S, edge_index).detach()
         s_recon_loss = S_recon_loss(S_hat[S_idx], S_true)
-        efl_term = abs(config.efl_gamma * efl(S_hat[train_idx], Y_pred))
+        efl_term = -abs(config.efl_gamma * efl(S_hat[train_idx], Y_pred))
         loss = loss + s_recon_loss + efl_term
         loss_dict["min_phase_loss"].append(loss.data.cpu().numpy())
         loss_dict["s_recon_loss"].append(s_recon_loss.data.cpu().numpy())
@@ -119,15 +142,27 @@ def train(config: Config, train_idx, val_idx, graph):
             avg_train_loss_max = np.mean(losses_max)
             train_losses.append(avg_train_loss_max)
             losses_max = []
-            val_accuracy, spd = evaluate(model, val_idx, config, graph, S_true, S_idx)
+            val_accuracy, spd, aod, eod, recall, far, precision, accuracy, F1, TPR, FPR, DI = evaluate(model, val_idx, config, graph, S_true, S_idx)
             print(
                 "Epoch: [{}/{}],  iter: {}, avg loss min phase: {:.5f}, avg loss max phase: {:.5f}, val accuracy: {:.4f}, spd: {:.4f}, training time = {:.4f}".format(
                     epoch, config.train_epoch, epoch, avg_train_loss, avg_train_loss_max, val_accuracy, spd, time.time() - start_time))
+            loss_dict["val_accuracy"].extend([val_accuracy])
+            loss_dict["spd"].extend([spd])
+            loss_dict['aod'].extend([aod])
+            loss_dict['eod'].extend([eod])
+            loss_dict['recall'].extend([recall])
+            loss_dict['far'].extend([far])
+            loss_dict['precision'].extend([precision])
+            loss_dict['accuracy'].extend([accuracy])
+            loss_dict['F1'].extend([F1])
+            loss_dict['TPR'].extend([TPR])
+            loss_dict['FPR'].extend([FPR])
+            loss_dict["DI"].extend([DI])
             if (val_accuracy*100 > val_acc_max) and (spd < spd_min):
                 torch.save({
                     'model1_state_dict': model.state_dict(),
                     'model2_state_dict': S_classifier.state_dict(),
-                }, 'model/models_combined_{:.0f}_{:.0f}_{}.pt'.format(val_accuracy*100, spd*100, epoch))
+                }, 'model/{}_{:.0f}_{:.0f}_{}.pt'.format(config.dataset_name, val_accuracy*100, spd*100, epoch))
                 val_acc_max = val_accuracy*100
                 spd_min = spd
         if epoch == config.train_epoch - 1:
