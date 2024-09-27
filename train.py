@@ -1,84 +1,135 @@
+import random
 import time
 
 import numpy as np
 import torch
-from torch import optim
+from torch import optim, sort
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
 from sklearn.metrics import accuracy_score
+from tqdm import tqdm
+
 from data import construct_A_from_edge_index
 from config import Config
-from model import GraphVAE, F_1_U_S, F_2_Y, hgr_correlation
+from metric import get_counts
+from model import GraphVAE, F_1_U_S, F_2_Y, hgr_correlation, efl, S_decoder, S_recon_loss
+import matplotlib.pyplot as plt
 
-
-def evaluate(model, val_iterator, config):
+def evaluate(model, val_idx, config, data, S_true, S_idx):
     all_preds = []
     all_y = []
-    for idx, data in enumerate(val_iterator):
-        X = data.x.float()
-        edge_index = data.edge_index.int()
-        Y = data.y.to(config.device)
-        X = Variable(X).to(config.device)
-        edge_index = Variable(edge_index).to(config.device)
-        loss, Y_new, S_hat, u_S = model(X,edge_index,Y)
-        predicted = (Y_new > 0.5).float().argmax(dim=1).unsqueeze(1)
-        all_preds.extend(predicted.numpy())
-        all_y.extend(np.array([0 if i[0] else 1 for i in Y.numpy()]))
+    X = data.x.float()
+    edge_index = data.edge_index.int()
+    Y = data.y.to(config.device)
+    X = Variable(X).to(config.device)
+    edge_index = Variable(edge_index).to(config.device)
+    loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term, Y_new, u_S = model(X,edge_index,Y, val_idx)
+    predicted = Y_new.float().argmax(dim=1).unsqueeze(1)
+    all_preds.extend(predicted.cpu().numpy())
+    all_y.extend(np.array([0 if i[0] else 1 for i in Y.cpu().numpy()]))
     score = accuracy_score(all_y, all_preds)
-    return score
+    predicted[predicted != 1] = 0
+    Y[Y != 1] = 0
+    spd = get_counts(predicted[S_idx].squeeze().cpu().numpy(), Y[S_idx].squeeze().cpu().numpy(), S_true.squeeze().cpu().numpy(), )
+    return score, spd
 
-def train(config: Config, train_iterator, val_iterator):
-    model = GraphVAE(config)
-    f1_u_S = F_1_U_S(config)
-    f2_Y = F_2_Y(config)
-    optimizer_min = optim.Adam(list(model.parameters()), lr=config.learning_rate)
-    scheduler_min = MultiStepLR(optimizer_min, milestones=config.LR_milestones, gamma=config.learning_rate)
-    optimizer_max = optim.Adam(list(f1_u_S.parameters()) + list(f2_Y.parameters()), lr=config.learning_rate)
-    scheduler_max = MultiStepLR(optimizer_max, milestones=config.LR_milestones, gamma=config.learning_rate)
+def train(config: Config, train_idx, val_idx, graph):
+    model = GraphVAE(config).to(config.device)
+    f1_u_S = F_1_U_S(config).to(config.device)
+    f2_Y = F_2_Y(config).to(config.device)
+    S_classifier = S_decoder(config).to(config.device)
+    optimizer_min = optim.Adam(list(model.parameters()), lr=config.learning_rate, weight_decay=1e-5)
+    scheduler_min = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_min, T_max=200, eta_min=1e-5)
+    optimizer_max = optim.Adam(list(f1_u_S.parameters()) + list(f2_Y.parameters()), lr=config.learning_rate, weight_decay=1e-5)
+    scheduler_max = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_max, T_max=200, eta_min=1e-5)
     model.train()
     f1_u_S.train()
     f2_Y.train()
+    S_classifier.train()
     train_losses = []
     losses = []
     losses_max = []
     start_time = time.time()
-    for epoch in range(config.train_epoch):
-        for id, data in enumerate(train_iterator):
-            optimizer_min.zero_grad()
-            X = data.x.float()
-            edge_index = data.edge_index.int()
-            Y = data.y.float().to(config.device)
-            X = Variable(X).to(config.device)
-            edge_index = Variable(edge_index).to(config.device)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(list(f1_u_S.parameters()) + list(f2_Y.parameters()), max_norm=1.0)
+    loss_dict = {"min_phase_loss":[],
+                "s_recon_loss":[],
+                "efl_term":[],
+                "Y_recon_loss":[],
+                "X_recon_loss":[],
+                "A_recon_loss":[],
+                "kl_u_y":[],
+                "kl_u_s":[],
+                "hgr_term_min_phase":[],
+                "max_phase_loss":[]}
+    val_acc_max = 70
+    spd_min = 1e8
+    X = graph.x.float()
+    edge_index = graph.edge_index.int()
+    Y = graph.y.float().to(config.device)
+    X = Variable(X).to(config.device)
+    edge_index = Variable(edge_index).to(config.device)
+    S_idx = torch.tensor(random.sample(sorted(train_idx), 200), dtype = torch.int32)
+    S_true = graph.s.float()[S_idx].to(config.device)
+    print(train_idx)
+    for epoch in tqdm(range(config.train_epoch)):
+        optimizer_min.zero_grad()
+        # Min phase
+        loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term, Y_pred, u_S = model(X, edge_index, Y, train_idx)
+        Y_pred = Y_pred.argmax(dim=1).unsqueeze(1)[train_idx]
+        S_hat = S_classifier(u_S, edge_index).detach()
+        s_recon_loss = S_recon_loss(S_hat[S_idx], S_true)
+        efl_term = abs(config.efl_gamma * efl(S_hat[train_idx], Y_pred))
+        loss = loss + s_recon_loss + efl_term
+        loss_dict["min_phase_loss"].append(loss.data.cpu().numpy())
+        loss_dict["s_recon_loss"].append(s_recon_loss.data.cpu().numpy())
+        loss_dict["efl_term"].append(efl_term.data.cpu().numpy())
+        loss_dict["Y_recon_loss"].append(Y_recon_loss.data.cpu().numpy())
+        loss_dict["X_recon_loss"].append(X_recon_loss.data.cpu().numpy())
+        loss_dict["A_recon_loss"].append(A_recon_loss.data.cpu().numpy())
+        loss_dict["kl_u_y"].append(kl_u_y.data.cpu().numpy())
+        loss_dict["kl_u_s"].append(kl_u_s.data.cpu().numpy())
+        loss_dict["hgr_term_min_phase"].append(hgr_term.data.cpu().numpy())
 
-            # Min phase
-            loss, Y_new, S_hat, u_S = model(X, edge_index, Y)
-            losses.append(loss.data.cpu().numpy())
-            loss.backward()
-            optimizer_min.step()
-            scheduler_min.step()
+        losses.append(loss.data.cpu().numpy())
+        loss.backward()
+        optimizer_min.step()
+        scheduler_min.step()
 
-            # Max phase
-            optimizer_max.zero_grad()
-            _, _, _, u_S = model(X, edge_index, Y)
-            f1_us = f1_u_S(u_S)
-            f2_y = f2_Y(Y)
-            hgr_loss = hgr_correlation(f1_us, f2_y)
-            losses_max.append(hgr_loss.data.cpu().numpy())
-            hgr_loss.backward()
-            optimizer_max.step()
-            scheduler_max.step()
+        # Max phase
+        optimizer_max.zero_grad()
+        mu, logvar = model.u_S_encoder(X, edge_index)
+        u_S = model.reparameterize(mu, logvar)
+        f1_us = f1_u_S(u_S)
+        f2_y = f2_Y(Y)
+        hgr_loss = hgr_correlation(f1_us, f2_y)
+        loss_dict["max_phase_loss"].append(hgr_loss.data.cpu().numpy())
 
-            print('Epoch: ', epoch, ', Iter: ', id, ', Loss: ', loss)
+        losses_max.append(hgr_loss.data.cpu().numpy())
+        hgr_loss.backward()
+        optimizer_max.step()
+        scheduler_max.step()
 
-            if (id) % 100 == 0:
-                avg_train_loss = np.mean(losses)
-                train_losses.append(avg_train_loss)
-                losses = []
-                avg_train_loss_max = np.mean(losses_max)
-                train_losses.append(avg_train_loss_max)
-                losses_max = []
-                val_accuracy = evaluate(model, val_iterator, config)
-                print(
-                    "Epoch: [{}/{}],  iter: {}, avg loss min phase: {:.5f}, avg loss max phase: {:.5f}, val accuracy: {:.4f}, training time = {:.4f}".format(
-                        epoch, config.train_epoch, id, avg_train_loss, avg_train_loss_max, val_accuracy, time.time() - start_time))
+        # print('Epoch: ', epoch,', Loss: ', loss)
+
+        if (epoch) % 100 == 0:
+            avg_train_loss = np.mean(losses)
+            train_losses.append(avg_train_loss)
+            losses = []
+            avg_train_loss_max = np.mean(losses_max)
+            train_losses.append(avg_train_loss_max)
+            losses_max = []
+            val_accuracy, spd = evaluate(model, val_idx, config, graph, S_true, S_idx)
+            print(
+                "Epoch: [{}/{}],  iter: {}, avg loss min phase: {:.5f}, avg loss max phase: {:.5f}, val accuracy: {:.4f}, spd: {:.4f}, training time = {:.4f}".format(
+                    epoch, config.train_epoch, epoch, avg_train_loss, avg_train_loss_max, val_accuracy, spd, time.time() - start_time))
+            if (val_accuracy*100 > val_acc_max) and (spd < spd_min):
+                torch.save({
+                    'model1_state_dict': model.state_dict(),
+                    'model2_state_dict': S_classifier.state_dict(),
+                }, 'model/models_combined_{:.0f}_{:.0f}_{}.pt'.format(val_accuracy*100, spd*100, epoch))
+                val_acc_max = val_accuracy*100
+                spd_min = spd
+        if epoch == config.train_epoch - 1:
+            torch.save(loss_dict, "data/loss_dict.pt")
+
