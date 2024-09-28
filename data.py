@@ -3,12 +3,15 @@ from scipy.io import loadmat, savemat
 from sklearn.model_selection import train_test_split
 from torch.utils.data import random_split
 from torch_geometric.data import InMemoryDataset, Data, DataLoader
+from torch_geometric.utils import to_networkx
 import os, sys
 from config import Config
 import torch
 import numpy as np
 import torch
 import torch.nn.functional as F
+import networkx as nx
+from sklearn.cluster import SpectralClustering
 
 def generate_sample_graph(num_nodes, num_feats, num_labels):
     X = np.random.rand(num_nodes, num_feats)
@@ -67,18 +70,62 @@ class GraphDataset(InMemoryDataset):
                         data = self.pre_transform(data)
                     data_list.append(data)
             else:
+                print("Loading Graph...")
                 graph = read_graphs(raw_path, "pt")
                 data = Data(x=graph['X'], edge_index=graph['edge_index'], y=graph['Y'], s=graph["S"])
+                network = construct_A_from_edge_index(graph['edge_index'], len(graph['X']))
+                print("Creating subgraphs...")
+                G = to_networkx(data, to_undirected=True)
+                pr = nx.pagerank(G, alpha=0.85)
+                pr_scores = np.array([pr[node] for node in G.nodes()])
+                labels = np.digitize(pr_scores, bins=np.histogram(pr_scores, bins=4)[1]) - 1
+                subgraphs = []
+                print("Processing subgraphs...")
+                for i in range(4):
+                    # Get nodes belonging to cluster i
+                    cluster_nodes = np.where(labels == i)[0]
+
+                    # Extract the subgraph
+                    subgraph = G.subgraph(cluster_nodes).copy()
+
+                    # Relabel nodes to have continuous indices starting from 0
+                    mapping = {node: idx for idx, node in enumerate(subgraph.nodes())}
+                    inverse_mapping = {idx: node for node, idx in mapping.items()}
+                    subgraph = nx.relabel_nodes(subgraph, mapping)
+
+
+                    # Convert to edge_index
+                    edge_index = torch.tensor(list(subgraph.edges()), dtype=torch.long).t().contiguous()
+                    # Ensure edge_index has shape [2, num_edges]
+                    if edge_index.size(0) != 2:
+                        edge_index = edge_index.t()
+                    if len(mapping) < 4:
+                        continue
+                    print(max(edge_index[0]))
+                    print(max(edge_index[1]))
+                    print(max(mapping.values()))
+
+                    subgraph_idx = [mapping[idx] for idx in cluster_nodes]
+                    print(max(subgraph_idx))
+                    print(len(mapping))
+                    # Get node features and labels
+                    x_sub = torch.tensor(graph['X'][subgraph_idx], dtype=torch.float)
+                    y_sub = torch.tensor(graph['Y'][subgraph_idx], dtype=torch.float)
+                    S_sub = torch.tensor(graph['S'][subgraph_idx], dtype=torch.float)
+
+                    # Create Data object
+                    print("Splitting train val for each subgraph...")
+                    data_sub = split_graph_train_val(Data(x=x_sub, edge_index=edge_index, y=y_sub, s=S_sub))
+                    subgraphs.append(data_sub)
                 if self.pre_transform is not None:
                     data = self.pre_transform(data)
-                data_list.append(data)
 
         if self.pre_filter is not None:
-            data_list = [data for data in data_list if self.pre_filter(data)]
+            subgraphs = [data_sub for data_sub in subgraphs if self.pre_filter(data_sub)]
 
         # 将数据存储到磁盘上
-        data, slices = self.collate(data_list)
-        torch.save((data, slices), self.processed_paths[0])
+        data_sub, slices = self.collate(subgraphs)
+        torch.save((data_sub, slices), self.processed_paths[0])
 
 def load_nba_data(config):
     dataset_name = "nba"
@@ -185,7 +232,6 @@ def load_german_data(config):
             network[line[0], line[1]] = 1
             network[line[1], line[0]] = 1
             line = file.readline()
-    print(german_node_feature)
     dataset = {}
     dataset["edge_index"] = torch.nonzero(torch.tensor(network).float(), as_tuple=False).t()
     dataset["Y"] = torch.tensor(german_label)
@@ -201,9 +247,46 @@ def load_german_data(config):
     result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
     return result
 
+def load_credit_data(config):
+    dataset_name = "credit"
+    data = pd.read_csv(config.data_path + "/{}".format(dataset_name) + "/credit.csv")
+    # Extract sensitive matrix from 'Gender' column
+    credit_sensitive = data['Age'].values.astype(np.float32).reshape(-1, 1)
+    credit_label = data['NoDefaultNextMonth'].values.astype(np.float32).reshape(-1, 1)
+    # Drop 'GoodCustomer' and 'Gender' to create feature matrix
+    feature_columns = data.drop(columns=['NoDefaultNextMonth', 'Age'])
+      # Convert to matrix form
+    feature_columns = feature_columns.apply(pd.to_numeric, errors='coerce')
+    credit_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(credit_node_feature), len(credit_node_feature)))
+    for i in range(len(network)):
+        network[i, i] = 1
+    with open(config.data_path + "/{}".format(dataset_name) + "/credit_edges.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split(' ')))
+            network[line[0], line[1]] = 1
+            network[line[1], line[0]] = 1
+            line = file.readline()
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(credit_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(credit_node_feature))
+    dataset["S"] = min_max_scale_features(torch.tensor(credit_sensitive))
+    config.num_nodes = credit_node_feature.shape[0]
+    config.num_feats = credit_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(credit_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "credit"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
+    return result
+
 def load_dataset(config: Config, dataset = "nba"):
-    assert dataset in ['generate','nba','german'], \
-    "dataset parameter should be one of: ['generate','nba','german']"
+    assert dataset in ['generate','nba','german', 'credit'], \
+    "dataset parameter should be one of: ['generate','nba','german', 'credit']"
     if not os.path.exists(config.data_path + "/{}/raw".format(dataset)):
         os.mkdir(config.data_path + "/{}/raw".format(dataset))
 
@@ -225,6 +308,8 @@ def load_dataset(config: Config, dataset = "nba"):
         dataset = load_nba_data(config)
     elif dataset == "german":
         dataset = load_german_data(config)
+    elif dataset == "credit":
+        dataset = load_credit_data(config)
     return dataset
 def split_data_train_val(dataset, config):
     train_size = int(config.train_size * len(dataset))  # 80% for training
@@ -239,24 +324,13 @@ def split_graph_train_val(data, val_ratio=0.2):
     # Assuming 'data' is a PyTorch Geometric 'Data' object with 'y' as labels.
     num_nodes = len(data.x)
     # Get the indices of all nodes
-    nodes = torch.arange(num_nodes)
-
     num_train_nodes = int(num_nodes*(1-val_ratio))
     train_mask = torch.zeros(num_nodes, dtype=torch.bool)
     train_mask[: num_train_nodes] = True
-
-    # Add train mask to data object
-    data.train_mask = train_mask
-
     # Create a boolean mask for test mask
-    val_mask = ~data.train_mask
-    data.val_mask = val_mask
+    val_mask = ~train_mask
     # Split the nodes into train and validation sets
-
-    train_idx = data.train_mask.nonzero(as_tuple=False).view(-1)
-    val_idx = data.val_mask.nonzero(as_tuple=False).view(-1)
-
-    return data, train_idx, val_idx
+    return Data(x = data.x, y = data.y, edge_index=data.edge_index, s = data.s, train_mask = train_mask, val_mask = val_mask)
 
 def construct_A_from_edge_index(edge_index, num_nodes):
     # Initialize an empty adjacency matrix

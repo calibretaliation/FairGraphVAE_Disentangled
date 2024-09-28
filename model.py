@@ -21,9 +21,9 @@ from data import generate_sample_graph, construct_A_from_edge_index, recover_adj
 class U_S_encoder(nn.Module):
     def __init__(self, config):
         super(U_S_encoder, self).__init__()
-        self.conv1 = GCNConv(in_channels=config.num_feats, out_channels=config.gcn_hidden_dim, cached=True)
-        self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S, cached=True)
-        self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S, cached=True)
+        self.conv1 = GCNConv(in_channels=config.num_feats, out_channels=config.gcn_hidden_dim)
+        self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S)
+        self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S)
 
     def forward(self, x, edge_index):
 
@@ -32,9 +32,9 @@ class U_S_encoder(nn.Module):
 class U_Y_encoder(nn.Module):
     def __init__(self, config):
         super(U_Y_encoder, self).__init__()
-        self.conv1 = GCNConv(in_channels=config.num_feats+1, out_channels=config.gcn_hidden_dim, cached=True)
-        self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y, cached=True)
-        self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y, cached=True)
+        self.conv1 = GCNConv(in_channels=config.num_feats+1, out_channels=config.gcn_hidden_dim)
+        self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y)
+        self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y)
 
     def forward(self, x, edge_index, Y):
         x = torch.cat((x,Y), dim=1)
@@ -57,17 +57,20 @@ class A_decoder(nn.Module):
     def __init__(self, config):
         super(A_decoder, self).__init__()
         self.config = config
-        self.num_edges = config.num_nodes * (config.num_nodes - 1) // 2 + config.num_nodes
-        self.fc1_A = nn.Linear(config.num_nodes*(config.latent_dim_S + config.latent_dim_Y), 512, device=torch.device(config.device))
-        self.fc2_A = nn.Linear(512, self.num_edges, device=torch.device(config.device))
         self.sigmoid = nn.Sigmoid()
     def forward(self, u_S, u_Y):
 
-        feat = torch.cat((u_S, u_Y), dim=1).flatten()
-        l = self.fc1_A(feat).relu()
-        l = self.fc2_A(l)
-
-        A = recover_adj_lower(self.sigmoid(l), self.config)
+        feat = torch.cat((u_S, u_Y), dim=1)
+        raw_scores = torch.matmul(feat, feat.T)
+        # Apply sigmoid to get probabilities
+        adj_prob = torch.sigmoid(raw_scores)
+        # Enforce symmetry
+        adj_prob = 0.5 * (adj_prob + adj_prob.T)
+        A = (adj_prob > 0.5).float()
+        # A = recover_adj_lower(self.sigmoid(l), self.config)
+        n = A.size(0)
+        row_indices, col_indices = torch.tril_indices(row=n, col=n, offset=0)
+        l = A[row_indices, col_indices].flatten()
         return A, l
 class X_decoder(nn.Module):
     def __init__(self, config):
@@ -130,8 +133,8 @@ class GraphVAE(nn.Module):
             if isinstance(m, torch_geometric.nn.GCNConv):
                 torch.nn.init.xavier_uniform_(m.lin.weight)
 
-    def recon_edge_loss(self, l, A):
-        A = construct_A_from_edge_index(A, self.config.num_nodes)
+    def recon_edge_loss(self, l, A, num_nodes):
+        A = construct_A_from_edge_index(A, num_nodes)
         l_original = A[np.triu_indices_from(A)].to(self.config.device)
         edge_loss =nn.MSELoss()(l, l_original)
         return edge_loss
@@ -157,7 +160,7 @@ class GraphVAE(nn.Module):
                       u_Y,
                       idx):
 
-
+        num_nodes = len(Y_true)
         # S_recon_loss = self.S_recon_loss(S_hat)
         # Y_pred, _ = torch.max(Y_pred[idx], dim=1, keepdim=True)
         # Y_prime, _ = torch.max(Y_prime[idx], dim=1, keepdim=True)
@@ -171,7 +174,7 @@ class GraphVAE(nn.Module):
         # 2. Reconstruction Loss for X (log P(X | U_S, A, U_Y))
         X_recon_loss = F.mse_loss(X_pred[idx].float(), X_true[idx].float())
 
-        A_recon_loss = self.recon_edge_loss(l, edge_index)
+        A_recon_loss = self.recon_edge_loss(l, edge_index, num_nodes)
 
         # 4. KL Divergence for U_Y (KL(Q(U_Y | X, A, Y) || P(U_Y)))
         kl_u_y = -0.5 * torch.sum(1 + logvar_u_Y - mu_u_Y.pow(2) - logvar_u_Y.exp() + 1e-8)
@@ -208,6 +211,7 @@ class GraphVAE(nn.Module):
 
         return elbo, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term
     def forward(self, X, edge_index, Y, idx):
+        assert edge_index.max().item() <= len(X)
 
         mu_S, logvar_S = self.u_S_encoder(X,edge_index)
         mu_Y, logvar_Y = self.u_Y_encoder(X,edge_index,Y)
