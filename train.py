@@ -13,10 +13,15 @@ from data import construct_A_from_edge_index
 from config import Config
 from metric import get_counts
 from model import GraphVAE, F_1_U_S, F_2_Y, hgr_correlation, efl, S_decoder, S_recon_loss
-import matplotlib.pyplot as plt
 
+import logging
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%d/%m/%Y %I:%M:%S %p')
+handler = logging.FileHandler('log/train.log')
+handler.setFormatter(log_format)
+logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.propagate = False
 def evaluate(model, val_idx, config, data, S_true, S_idx):
-    all_preds = []
     X = data.x.float()
     edge_index = data.edge_index.int()
     Y = data.y.to(config.device).long()
@@ -27,8 +32,7 @@ def evaluate(model, val_idx, config, data, S_true, S_idx):
     # predicted = (Y_new > 0.5).float()
     all_preds = Y_new.data.argmax(dim=1).cpu().numpy()
     all_y = Y.squeeze().cpu().numpy()
-    print(np.unique(all_y, return_counts=True))
-    print(np.unique(all_preds, return_counts=True))
+    logger.info(f"Ground-Truth:\t{np.unique(all_y, return_counts=True)}\nPrediction:\t{np.unique(all_preds, return_counts=True)}")
     score = accuracy_score(all_y, all_preds)
     spd = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), )
     aod = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "aod")
@@ -41,9 +45,12 @@ def evaluate(model, val_idx, config, data, S_true, S_idx):
     TPR = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "TPR")
     FPR = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "FPR")
     DI = get_counts(all_preds[S_idx], all_y[S_idx], S_true.squeeze().cpu().numpy(), metric = "DI")
+    logger.info(f"score:\t{score}\nspd:\t{spd}\naod:\t{aod}\neod:\t{eod}\nrecall:\t{recall}\nfar:\t{far}\nprecision:\t{precision}\naccuracy:\t{accuracy}\nF1:\t{F1}\nTPR:\t{TPR}\nFPR:\t{FPR}\nDI:\t{DI}")
     return score, spd, aod, eod, recall, far, precision, accuracy, F1, TPR, FPR, DI
 
 def train(config: Config, train_idx, val_idx, graph):
+    logger.info(f"Start training:\nDataset:\t{config.dataset_name}\nNum Epoch:\t{config.train_epoch}")
+    logger.info(f"Initializing model...")
     model = GraphVAE(config).to(config.device)
     f1_u_S = F_1_U_S(config).to(config.device)
     f2_Y = F_2_Y(config).to(config.device)
@@ -87,6 +94,7 @@ def train(config: Config, train_idx, val_idx, graph):
                  }
     val_acc_max = 70
     spd_min = 1e8
+    logger.info(f"Loading dataset...")
     X = graph.x.float()
     edge_index = graph.edge_index.int()
     Y = graph.y.float().to(config.device)
@@ -94,8 +102,14 @@ def train(config: Config, train_idx, val_idx, graph):
     edge_index = Variable(edge_index).to(config.device)
     S_idx = torch.tensor(random.sample(sorted(train_idx), 200), dtype = torch.int32)
     S_true = graph.s.float()[S_idx].to(config.device)
-    print(train_idx)
+    logger.info(f"Dataset informations:\t{graph}\nNum Nodes:\t{len(X)}\nMax edge index:\t{edge_index.max()}"
+                f"\nTrain Size:\t{len(train_idx)}\nVal Size:\t{len(val_idx)}\nSensitive showed:\t{len(S_idx)}"
+                f"\nY:\t{Y.unique(return_counts=True)}\nS:\t{S_true.unique(return_counts=True)}")
+    logger.info(f"Start Training...")
     for epoch in tqdm(range(config.train_epoch)):
+        logger.info(f"Epoch:\t{epoch}")
+        logger.info(f"Min phase:")
+
         optimizer_min.zero_grad()
         # Min phase
         loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term, Y_pred, u_S = model(X, edge_index, Y, train_idx)
@@ -103,6 +117,7 @@ def train(config: Config, train_idx, val_idx, graph):
         S_hat = S_classifier(u_S, edge_index).detach()
         s_recon_loss = S_recon_loss(S_hat[S_idx], S_true)
         efl_term = -abs(config.efl_gamma * efl(S_hat[train_idx], Y_pred))
+        logger.info(f"Calculating loss...")
         loss = loss + s_recon_loss + efl_term
         loss_dict["min_phase_loss"].append(loss.data.cpu().numpy())
         loss_dict["s_recon_loss"].append(s_recon_loss.data.cpu().numpy())
@@ -113,12 +128,13 @@ def train(config: Config, train_idx, val_idx, graph):
         loss_dict["kl_u_y"].append(kl_u_y.data.cpu().numpy())
         loss_dict["kl_u_s"].append(kl_u_s.data.cpu().numpy())
         loss_dict["hgr_term_min_phase"].append(hgr_term.data.cpu().numpy())
-
         losses.append(loss.data.cpu().numpy())
+        logger.info(f"Training loss min phase:\t{loss.data.cpu().numpy()}")
         loss.backward()
         optimizer_min.step()
         scheduler_min.step()
 
+        logger.info(f"Max phase:")
         # Max phase
         optimizer_max.zero_grad()
         mu, logvar = model.u_S_encoder(X, edge_index)
@@ -127,6 +143,7 @@ def train(config: Config, train_idx, val_idx, graph):
         f2_y = f2_Y(Y)
         hgr_loss = hgr_correlation(f1_us, f2_y)
         loss_dict["max_phase_loss"].append(hgr_loss.data.cpu().numpy())
+        logger.info(f"Training loss max phase:\t{hgr_loss.data.cpu().numpy()}")
 
         losses_max.append(hgr_loss.data.cpu().numpy())
         hgr_loss.backward()
@@ -134,14 +151,15 @@ def train(config: Config, train_idx, val_idx, graph):
         scheduler_max.step()
 
         # print('Epoch: ', epoch,', Loss: ', loss)
-
-        if (epoch) % 100 == 0:
+        logger.info(f"Evaluating...")
+        if (epoch) % config.log_epoch == 0:
             avg_train_loss = np.mean(losses)
             train_losses.append(avg_train_loss)
             losses = []
             avg_train_loss_max = np.mean(losses_max)
             train_losses.append(avg_train_loss_max)
             losses_max = []
+            logger.info(f"Inferring...")
             val_accuracy, spd, aod, eod, recall, far, precision, accuracy, F1, TPR, FPR, DI = evaluate(model, val_idx, config, graph, S_true, S_idx)
             print(
                 "Epoch: [{}/{}],  iter: {}, avg loss min phase: {:.5f}, avg loss max phase: {:.5f}, val accuracy: {:.4f}, spd: {:.4f}, training time = {:.4f}".format(
@@ -159,12 +177,14 @@ def train(config: Config, train_idx, val_idx, graph):
             loss_dict['FPR'].extend([FPR])
             loss_dict["DI"].extend([DI])
             if (val_accuracy*100 > val_acc_max) and (spd < spd_min):
+                logger.info(f"FOUND BEST MODEL:\nEpoch:\t{epoch}\nAccuracy:\t{val_accuracy*100}\nSPD:\t{spd*100}")
                 torch.save({
                     'model1_state_dict': model.state_dict(),
                     'model2_state_dict': S_classifier.state_dict(),
                 }, 'model/{}_{:.0f}_{:.0f}_{}.pt'.format(config.dataset_name, val_accuracy*100, spd*100, epoch))
                 val_acc_max = val_accuracy*100
                 spd_min = spd
+            logger.info("Done evaluating, continue...")
         if epoch == config.train_epoch - 1:
             torch.save(loss_dict, "data/loss_dict.pt")
 

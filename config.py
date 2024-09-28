@@ -20,6 +20,6 @@ class Config():
         self.learning_rate = 1e-4
         self.LR_milestones = [500, 1000]
         self.train_epoch = 10001
-        self.log_epoch = 10
+        self.log_epoch = 100
         self.lambda_hgr = 1e4
         self.efl_gamma =1e4

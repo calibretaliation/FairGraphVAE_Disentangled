@@ -13,12 +13,23 @@ import warnings
 warnings.filterwarnings("ignore")
 import os
 from train import train
+import logging
 
+logging.basicConfig(filename='log/all.log',
+                    format='%(asctime)s %(message)s', datefmt='%d/%m/%Y %I:%M:%S %p',
+                    encoding='utf-8',
+                    level=logging.DEBUG)
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%d/%m/%Y %I:%M:%S %p')
+handler = logging.FileHandler('log/main.log')
+handler.setFormatter(log_format)
+logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.propagate = False
 parser = argparse.ArgumentParser(
                     description="Implementation of: Graph Fairness without Demographics through Fair Inference")
 parser.add_argument("--mode", default = "train", choices=["debug", "train", "test"],
                     help = "Mode debug, train or test GraphVAE model")
-parser.add_argument("--dataset", default = "nba", choices=["generate", "nba", "german"],
+parser.add_argument("--dataset", default = "nba", choices=["generate", "nba", "german",'credit'],
                     help = "Dataset to train model")
 parser.add_argument("--device", default = "cpu", choices=["cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3"],
                     help = "Device config")

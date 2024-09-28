@@ -200,10 +200,45 @@ def load_german_data(config):
     save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
     result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
     return result
-
+def load_credit_data(config):
+    dataset_name = "credit"
+    data = pd.read_csv(config.data_path + "/{}".format(dataset_name) + "/credit.csv")
+    # Extract sensitive matrix from 'Gender' column
+    credit_sensitive = data['Age'].values.astype(np.float32).reshape(-1, 1)
+    credit_label = data['NoDefaultNextMonth'].values.astype(np.float32).reshape(-1, 1)
+    # Drop 'GoodCustomer' and 'Gender' to create feature matrix
+    feature_columns = data.drop(columns=['NoDefaultNextMonth', 'Age'])
+      # Convert to matrix form
+    feature_columns = feature_columns.apply(pd.to_numeric, errors='coerce')
+    credit_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(credit_node_feature), len(credit_node_feature)))
+    for i in range(len(network)):
+        network[i, i] = 1
+    with open(config.data_path + "/{}".format(dataset_name) + "/credit_edges.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split(' ')))
+            network[line[0], line[1]] = 1
+            network[line[1], line[0]] = 1
+            line = file.readline()
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(credit_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(credit_node_feature))
+    dataset["S"] = min_max_scale_features(torch.tensor(credit_sensitive))
+    config.num_nodes = credit_node_feature.shape[0]
+    config.num_feats = credit_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(credit_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "credit"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
+    return result
 def load_dataset(config: Config, dataset = "nba"):
-    assert dataset in ['generate','nba','german'], \
-    "dataset parameter should be one of: ['generate','nba','german']"
+    assert dataset in ['generate','nba','german','credit'], \
+    "dataset parameter should be one of: ['generate','nba','german','credit']"
     if not os.path.exists(config.data_path + "/{}/raw".format(dataset)):
         os.mkdir(config.data_path + "/{}/raw".format(dataset))
 
@@ -225,6 +260,8 @@ def load_dataset(config: Config, dataset = "nba"):
         dataset = load_nba_data(config)
     elif dataset == "german":
         dataset = load_german_data(config)
+    elif dataset == "credit":
+        dataset = load_credit_data(config)
     return dataset
 def split_data_train_val(dataset, config):
     train_size = int(config.train_size * len(dataset))  # 80% for training
