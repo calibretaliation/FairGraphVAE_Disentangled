@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 import pandas as pd
 from scipy.io import loadmat, savemat
 from sklearn.model_selection import train_test_split
@@ -5,6 +7,9 @@ from torch.utils.data import random_split
 from torch_geometric.data import InMemoryDataset, Data, DataLoader
 from torch_geometric.utils import to_networkx
 import os, sys
+
+from tqdm import tqdm
+
 from config import Config
 import torch
 import numpy as np
@@ -37,6 +42,249 @@ def read_graphs(path, type = "mat"):
         data = torch.load(path)
 
     return data
+def fair_transfer_probability(neighbor_list, sen_list):
+    prob_list = np.zeros(len(sen_list))
+    sen_dict = {}
+    for neighbor in neighbor_list:
+        sensitive_value = int(sen_list[neighbor])
+        if sensitive_value in sen_dict.keys():
+            sen_dict[sensitive_value] += 1
+        else:
+            sen_dict[sensitive_value] = 1
+    group_prob = 1/len(sen_dict)
+    for neighbor in neighbor_list:
+        prob = group_prob/sen_dict[int(sen_list[neighbor])]
+        prob_list[neighbor] = prob
+    return prob_list
+
+def cumulative_random_choice(c):
+    r = np.random.random()
+    cumulative_sum = 0
+    for i, prob in enumerate(c):
+        cumulative_sum += prob
+        if cumulative_sum >= r:
+            return i
+
+def fair_subgraph(node, neighbor_dict, sen_list, graph, num_sample=10, walk_length=50):
+    time = 0
+    sen_list = sen_list.data.cpu().numpy()
+    subgraph_nodes = set()
+    subgraph_edges = []
+    while time < num_sample:
+        current_node = node
+        for i in range(walk_length):
+            neighbor_list = list(neighbor_dict[current_node])
+            if len(neighbor_list) > 1 :
+                prob_list = fair_transfer_probability(neighbor_list, sen_list)
+                next_node = neighbor_list[cumulative_random_choice(prob_list)]
+                subgraph_nodes.add(next_node)
+                subgraph_edges.append([current_node, next_node])
+                current_node = next_node
+            elif (len(neighbor_list) == 1) and (neighbor_list[0] not in subgraph_nodes):
+                prob_list = fair_transfer_probability(neighbor_list, sen_list)
+                next_node = neighbor_list[cumulative_random_choice(prob_list)]
+                subgraph_nodes.add(next_node)
+                subgraph_edges.append([current_node, next_node])
+                current_node = next_node
+            elif len(neighbor_list) == 0:
+                time += 1
+                break
+        time += 1
+
+    network = np.zeros((max(subgraph_nodes)+1, max(subgraph_nodes)+1))
+    for i in range(len(network)):
+        network[i, i] = 1
+    for edge in subgraph_edges:
+        network[edge[0], edge[1]] = 1
+        network[edge[1], edge[0]] = 1
+    edge_index = torch.nonzero(torch.Tensor(network).float(), as_tuple=False).t()
+    print(f"DONE RANDOM WALK: {len(subgraph_nodes)} NODES, {edge_index.shape[1]} EDGES")
+    return Data(x=graph['X'][list(subgraph_nodes)], edge_index=edge_index, y=graph['Y'][list(subgraph_nodes)], s=graph["S"][list(subgraph_nodes)], subgraph_nodes = torch.tensor(list(subgraph_nodes)))
+
+def fair_subgraph_concurrent(A, P, X, Y, S, device, L = 10, num_walks = 50):
+
+    A = torch.tensor(A, dtype=torch.float32, device=device)
+    P = torch.tensor(P, dtype=torch.float32, device=device)
+
+    # Normalize P to ensure each row sums to 1
+    P = P / P.sum(dim=1, keepdim=True)
+
+    num_nodes = A.shape[0]
+
+    # Precompute cumulative sums of the transition probabilities
+    P_cumsum = torch.cumsum(P, dim=1)  # Shape: (n, n)
+
+    # Initialize walks: shape (n, num_walks, L + 1)
+    walks = torch.zeros((num_nodes, num_walks, L + 1), dtype=torch.long, device=device)
+    walks[:, :, 0] = torch.arange(num_nodes, device=device).unsqueeze(1)  # Starting nodes
+
+    for t in range(1, L + 1):
+        current_nodes = walks[:, :, t - 1]  # Shape: (n, num_walks)
+        current_nodes_flat = current_nodes.reshape(-1)  # Shape: (n * num_walks)
+
+        # Get the cumulative distribution for the current nodes
+        cdf = P_cumsum[current_nodes_flat, :]  # Shape: (n * num_walks, n)
+
+        # Generate random values for sampling
+        random_values = torch.rand(num_nodes * num_walks, device=device).unsqueeze(1)
+
+        # Sample next nodes
+        next_nodes_flat = torch.sum(cdf < random_values, dim=1)
+
+        # Reshape back to (n, num_walks)
+        next_nodes = next_nodes_flat.view(num_nodes, num_walks)
+
+        # Update the walks with the next nodes
+        walks[:, :, t] = next_nodes
+
+    # Extract subgraphs
+    subgraphs = []
+
+    # Process each node to extract its subgraph
+    for i in range(num_nodes):
+        # Extract walks starting from node i
+        walks_i = walks[i, :, :]  # Shape: (num_walks, L + 1)
+
+        # Collect all unique nodes visited
+        nodes_in_walk = torch.unique(walks_i)
+
+        # Collect edges from walks_i
+        u = walks_i[:, :-1].reshape(-1)
+        v = walks_i[:, 1:].reshape(-1)
+        edges = torch.stack((u, v), dim=1)
+        edges = torch.sort(edges, dim=1)[0]
+        edges_unique = torch.unique(edges, dim=0)
+
+        # Relabel nodes
+        nodes_in_walk_np = nodes_in_walk.cpu().numpy()
+        num_nodes_in_subgraph = len(nodes_in_walk_np)
+        mapping = {old_id: new_id for new_id, old_id in enumerate(nodes_in_walk_np)}
+        X_sub= X[nodes_in_walk_np]
+        Y_sub = Y[nodes_in_walk_np]
+        S_sub = S[nodes_in_walk_np]
+
+        # Map edges
+        edges_np = edges_unique.cpu().numpy()
+        edges_mapped = np.array([[mapping[u], mapping[v]] for u, v in edges_np])
+        edge_index = edges_mapped.T
+
+        # Store the subgraph for node i
+        subgraphs.append({
+            'nodes': torch.tensor(np.arange(num_nodes_in_subgraph), dtype=torch.float32, device=device),
+            'edge_index': torch.tensor(edge_index, dtype=torch.int64, device=device),
+            'mapping': mapping,
+            'X': X_sub,
+            "Y": Y_sub,
+            'S': S_sub
+        })
+    return subgraphs
+
+
+def custom_sample_cdf(cdf):
+    # Generate random values, ensuring they are less than 1.0
+    random_values = torch.rand(cdf.size(0), device=cdf.device)
+    # Use torch.searchsorted to find the indices efficiently
+    next_nodes = torch.searchsorted(cdf, random_values.unsqueeze(1), right=False).squeeze(1)
+    return next_nodes
+def fair_subgraph_concurrent_with_batch(A, P, X, Y, S, device, L = 10, num_walks = 50):
+
+    A = torch.tensor(A, dtype=torch.float32, device=device)
+    P = torch.tensor(P, dtype=torch.float32, device=device)
+    row_sums = P.sum(dim=1, keepdim=True)
+    zero_row_mask = row_sums == 0
+
+    # For nodes with no outgoing edges, create self-loops
+    P[zero_row_mask.squeeze(), :] = 0
+    P[zero_row_mask.squeeze(), zero_row_mask.squeeze()] = 1.0
+    # Normalize P to ensure each row sums to 1
+    row_sums = P.sum(dim=1, keepdim=True)
+    P = P / row_sums
+
+    num_nodes = A.shape[0]
+
+    # Precompute cumulative sums of the transition probabilities
+    P_cumsum = torch.cumsum(P, dim=1)  # Shape: (n, n)
+    P_cumsum[:, -1] = 1.0
+
+    batch_size = 200
+    subgraphs = []
+
+    accumulated_nodes = defaultdict(set)  # Key: node ID, Value: set of node IDs visited
+    accumulated_edges = defaultdict(set)
+    for batch_start in tqdm(range(0, num_nodes, batch_size), position = 0, desc="Nodes", leave=False, colour="red"):
+        batch_end = min(batch_start + batch_size, num_nodes)
+        batch_indices = torch.arange(batch_start, batch_end, device=device)
+        batch_size_actual = len(batch_indices)
+
+        # Initialize walks for the batch
+        walks_batch = torch.zeros((len(batch_indices), num_walks, L + 1), dtype=torch.long, device=device)
+        walks_batch[:, :, 0] = batch_indices.unsqueeze(1)
+        for t in tqdm(range(1, L + 1), position = 1, desc="Walk length", leave=False, colour="green"):
+            current_nodes = walks_batch[:, :, t - 1]  # Shape: (batch_size_actual, num_walks)
+            current_nodes_flat = current_nodes.reshape(-1)
+            cdf = P_cumsum[current_nodes_flat, :]
+
+            next_nodes_flat = custom_sample_cdf(cdf)
+            # Generate random values for sampling
+            next_nodes = next_nodes_flat.view(batch_size_actual, num_walks)
+
+            # Update the walks with the next nodes
+            walks_batch[:, :, t] = next_nodes
+
+            # Update the walks with the next nodes
+            walks_batch[:, :, t] = next_nodes
+            for idx, i in tqdm(enumerate(batch_indices), position = 2, leave=False):
+                walks_i = walks_batch[idx, :, :]
+
+                # Collect all unique nodes visited
+                nodes_in_walk = torch.unique(walks_i)
+                accumulated_nodes[i.cpu().item()].update(nodes_in_walk.cpu().numpy())
+                # Initialize a set to collect undirected edges
+                u = walks_i[:, :-1].reshape(-1)
+                v = walks_i[:, 1:].reshape(-1)
+                edges = torch.stack((u, v), dim=1)
+                edges = torch.sort(edges, dim=1)[0]
+                edges_unique = torch.unique(edges, dim=0)
+
+                # Collect edges from all walks
+                # for walk in walks_i:
+                #     u = walk[:-1]
+                #     v = walk[1:]
+                #     edges = torch.stack((u, v), dim=1)
+                #     # Convert edges to sorted tuples to represent undirected edges
+                #     edges = torch.sort(edges, dim=1)[0]
+                #     # Convert to list of tuples and add to set
+                #     edges_set.update([tuple(edge.cpu().numpy()) for edge in edges])
+                nodes_in_walk_np = nodes_in_walk.cpu().numpy()
+
+                # Map the edges to the new node IDs
+                edges_np = edges_unique.cpu().numpy()
+                accumulated_edges[i.cpu().item()].update([tuple(edge) for edge in edges_np])
+            for i in range(num_nodes):
+                # Get accumulated nodes and edges for node i
+                nodes_in_walk = np.array(list(accumulated_nodes[i]))
+                edges_set = accumulated_edges[i]
+                num_nodes_in_subgraph = len(nodes_in_walk)
+                mapping = {old_id: new_id for new_id, old_id in enumerate(nodes_in_walk)}
+
+                # Map edges to new node IDs
+                edges_np = np.array(list(edges_set))
+                edges_mapped = np.array([[mapping[u], mapping[v]] for u, v in edges_np])
+                edge_index = edges_mapped.T
+                # Transpose edges to get edge_index format if needed
+                X_sub= X[nodes_in_walk]
+                Y_sub = Y[nodes_in_walk]
+                S_sub = S[nodes_in_walk]
+
+                subgraphs.append({
+                    'nodes': torch.tensor(np.arange(num_nodes_in_subgraph), dtype=torch.float32, device=device),
+                    'edge_index': torch.tensor(edge_index, dtype=torch.int64, device=device),
+                    'mapping': mapping,
+                    'X': X_sub,
+                    "Y": Y_sub,
+                    'S': S_sub
+                })
+    return subgraphs
 class GraphDataset(InMemoryDataset):
     def __init__(self, root, dataset_name, transform=None, pre_transform=None):
         self.dataset_name = dataset_name
@@ -72,50 +320,22 @@ class GraphDataset(InMemoryDataset):
             else:
                 print("Loading Graph...")
                 graph = read_graphs(raw_path, "pt")
-                data = Data(x=graph['X'], edge_index=graph['edge_index'], y=graph['Y'], s=graph["S"])
+                device = "cuda:1"
+                neighbor_dict = defaultdict(set)
+                for src, dst in zip(graph['edge_index'][0], graph['edge_index'][1]):
+                    src = int(src.data.cpu())
+                    dst = int(dst.data.cpu())
+                    neighbor_dict[src].add(dst)
+                    neighbor_dict[dst].add(src)
                 network = construct_A_from_edge_index(graph['edge_index'], len(graph['X']))
                 print("Creating subgraphs...")
-                G = to_networkx(data, to_undirected=True)
-                pr = nx.pagerank(G, alpha=0.85)
-                pr_scores = np.array([pr[node] for node in G.nodes()])
-                labels = np.digitize(pr_scores, bins=np.histogram(pr_scores, bins=4)[1]) - 1
+                P = [fair_transfer_probability(list(neighbor_dict[node]), graph["S"].data.cpu().numpy()) for node in
+                     neighbor_dict.keys()]
                 subgraphs = []
+                new_subgraphs = fair_subgraph_concurrent_with_batch(network, P, graph["X"], graph["Y"], graph["S"], device = device)
                 print("Processing subgraphs...")
-                for i in range(4):
-                    # Get nodes belonging to cluster i
-                    cluster_nodes = np.where(labels == i)[0]
-
-                    # Extract the subgraph
-                    subgraph = G.subgraph(cluster_nodes).copy()
-
-                    # Relabel nodes to have continuous indices starting from 0
-                    mapping = {node: idx for idx, node in enumerate(subgraph.nodes())}
-                    inverse_mapping = {idx: node for node, idx in mapping.items()}
-                    subgraph = nx.relabel_nodes(subgraph, mapping)
-
-
-                    # Convert to edge_index
-                    edge_index = torch.tensor(list(subgraph.edges()), dtype=torch.long).t().contiguous()
-                    # Ensure edge_index has shape [2, num_edges]
-                    if edge_index.size(0) != 2:
-                        edge_index = edge_index.t()
-                    if len(mapping) < 4:
-                        continue
-                    print(max(edge_index[0]))
-                    print(max(edge_index[1]))
-                    print(max(mapping.values()))
-
-                    subgraph_idx = [mapping[idx] for idx in cluster_nodes]
-                    print(max(subgraph_idx))
-                    print(len(mapping))
-                    # Get node features and labels
-                    x_sub = torch.tensor(graph['X'][subgraph_idx], dtype=torch.float)
-                    y_sub = torch.tensor(graph['Y'][subgraph_idx], dtype=torch.float)
-                    S_sub = torch.tensor(graph['S'][subgraph_idx], dtype=torch.float)
-
-                    # Create Data object
-                    print("Splitting train val for each subgraph...")
-                    data_sub = split_graph_train_val(Data(x=x_sub, edge_index=edge_index, y=y_sub, s=S_sub))
+                for subgraph in new_subgraphs:
+                    data_sub = split_graph_train_val(Data(x=subgraph['X'], edge_index=subgraph['edge_index'], y=subgraph['Y'], s=subgraph['S']))
                     subgraphs.append(data_sub)
                 if self.pre_transform is not None:
                     data = self.pre_transform(data)
@@ -123,7 +343,6 @@ class GraphDataset(InMemoryDataset):
         if self.pre_filter is not None:
             subgraphs = [data_sub for data_sub in subgraphs if self.pre_filter(data_sub)]
 
-        # 将数据存储到磁盘上
         data_sub, slices = self.collate(subgraphs)
         torch.save((data_sub, slices), self.processed_paths[0])
 
@@ -283,10 +502,79 @@ def load_credit_data(config):
     result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
     print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
     return result
+def load_pokecz_data(config):
+    dataset_name = "pokecz"
+    pokecz = pd.read_csv(config.data_path + "/{}".format(dataset_name) + "/region_job_2.csv")
+    pokecz["I_am_working_in_field"] = pokecz["I_am_working_in_field"].apply(lambda x: int(float(x == -1)))
+    pokecz["region"].value_counts()
+    pokecz_label = pokecz['I_am_working_in_field'].values.astype(np.float32).reshape(-1, 1)
+    # Extract sensitive matrix from 'Gender' column
+    pokecz_sensitive = pokecz['region'].values.astype(np.float32).reshape(-1, 1)
+    feature_columns = pokecz.drop(columns=['I_am_working_in_field', 'region', 'user_id'])
+    pokecz_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(pokecz_node_feature), len(pokecz_node_feature)))
+    node_dict = {user: id for id, user in enumerate(pokecz['user_id'])}
 
+    with open(config.data_path + "/{}".format(dataset_name) + "/region_job_2_relationship.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split('\t')))
+            network[node_dict[line[0]], node_dict[line[1]]] = 1
+            network[node_dict[line[1]], node_dict[line[0]]] = 1
+            line = file.readline()
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.Tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(pokecz_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(pokecz_node_feature))
+    dataset["S"] = min_max_scale_features(torch.tensor(pokecz_sensitive))
+    config.num_nodes = pokecz_node_feature.shape[0]
+    config.num_feats = pokecz_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(pokecz_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "pokecz"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
+    return result
+
+def load_bail_data(config):
+    dataset_name = "bail"
+    path = config.data_path + "/{}/".format(dataset_name)
+    bail = pd.read_csv(path + "bail.csv")
+
+    bail_label = bail['RECID'].values.astype(np.float32).reshape(-1, 1)
+    # # Extract sensitive matrix from 'Gender' column
+    bail_sensitive = bail['WHITE'].values.astype(np.float32).reshape(-1, 1)
+    feature_columns = bail.drop(columns=['RECID', 'WHITE'])
+    bail_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(bail_node_feature), len(bail_node_feature)))
+
+    with open(path + "bail_edges.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split(' ')))
+            network[line[0], line[1]] = 1
+            network[line[1], line[0]] = 1
+            line = file.readline()
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.Tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(bail_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(bail_node_feature))
+    dataset["S"] = min_max_scale_features(torch.tensor(bail_sensitive))
+    config.num_nodes = bail_node_feature.shape[0]
+    config.num_feats = bail_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(bail_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "bail"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
+    return result
 def load_dataset(config: Config, dataset = "nba"):
-    assert dataset in ['generate','nba','german', 'credit'], \
-    "dataset parameter should be one of: ['generate','nba','german', 'credit']"
+    assert dataset in ['generate','nba','german', 'credit',"pokecz", 'bail'], \
+    "dataset parameter should be one of: ['generate','nba','german', 'credit','pokecz','bail']"
     if not os.path.exists(config.data_path + "/{}/raw".format(dataset)):
         os.mkdir(config.data_path + "/{}/raw".format(dataset))
 
@@ -310,6 +598,10 @@ def load_dataset(config: Config, dataset = "nba"):
         dataset = load_german_data(config)
     elif dataset == "credit":
         dataset = load_credit_data(config)
+    elif dataset == "pokecz":
+        dataset = load_pokecz_data(config)
+    elif dataset == "bail":
+        dataset = load_bail_data(config)
     return dataset
 def split_data_train_val(dataset, config):
     train_size = int(config.train_size * len(dataset))  # 80% for training
