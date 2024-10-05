@@ -136,13 +136,12 @@ class GraphVAE(nn.Module):
     def recon_edge_loss(self, l, A, num_nodes):
         A = construct_A_from_edge_index(A, num_nodes)
         l_original = A[np.triu_indices_from(A)].to(self.config.device)
-        edge_loss =nn.MSELoss()(l, l_original)
+        edge_loss =nn.MSELoss()(l, l_original)*1e4
         return edge_loss
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps.mul(std).add_(mu)
-
 
     def loss_function(self,
                       X_pred,

@@ -1,18 +1,19 @@
 import argparse
 import random
 import re
-
+import pandas as pd
 import torch
 
-from config import Config
+from config import config
 from data import load_dataset, split_data_train_val, split_graph_train_val
 from model import GraphVAE, run_model_debug
 from torch.utils.data import random_split
 import numpy as np
 import warnings
+
 warnings.filterwarnings("ignore")
 import os
-from train import train
+from train import train, grid_search_train
 import logging
 
 logging.basicConfig(filename='log/all.log',
@@ -28,28 +29,30 @@ logger.propagate = False
 from torch_geometric.loader import DataLoader
 
 parser = argparse.ArgumentParser(
-                    description="Implementation of: Graph Fairness without Demographics through Fair Inference")
-parser.add_argument("--mode", default = "train", choices=["debug", "train", "test"],
-                    help = "Mode debug, train or test GraphVAE model")
-parser.add_argument("--dataset", default = "nba", choices=["generate", "nba", "german", "credit","pokecz","bail"],
-                    help = "Dataset to train model")
-parser.add_argument("--device", default = "cpu", choices=["cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-                    help = "Device config")
-parser.add_argument("--num_epoch", default = 10001,
-                    help = "Train epoch config")
-parser.add_argument("--train_size", default = 0.8,
-                    help = "Train size for split config")
-parser.add_argument("--efl", default = 10000,
-                    help = "EFL coefficient for fair loss")
-parser.add_argument("--hgr", default = 10000,
-                    help = "HGR coefficient for u_Y and S in dependence")
-parser.add_argument("--log_epoch", default = 10,
-                    help = "Number of epochs per evaluation")
+    description="Implementation of: Graph Fairness without Demographics through Fair Inference")
+parser.add_argument("--mode", default="train", choices=["debug", "train", "test", "grid"],
+                    help="Mode debug, train, test or run grid search GraphVAE model")
+parser.add_argument("--dataset", default="nba", choices=["generate", "nba", "german", "credit", "pokecz", "bail","pokecn"],
+                    help="Dataset to train model")
+parser.add_argument("--device", default="cpu", choices=["cpu", "cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+                    help="Device config")
+parser.add_argument("--num_epoch", default=10001,
+                    help="Train epoch config")
+parser.add_argument("--train_size", default=0.8,
+                    help="Train size for split config")
+parser.add_argument("--efl", default=10000,
+                    help="EFL coefficient for fair loss")
+parser.add_argument("--hgr", default=10000,
+                    help="HGR coefficient for u_Y and S in dependence")
+parser.add_argument("--log_epoch", default=10,
+                    help="Number of epochs per evaluation")
+parser.add_argument("--walk_length", default=50,
+                    help="Number of walk length for subgraph")
+parser.add_argument("--num_walk", default=20,
+                    help="Number of random walk sample for subgraph")
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    config = Config()
-
     if args.device is not None:
         if args.device != "cpu":
             match = re.search(r':(\d)', args.device)
@@ -67,8 +70,17 @@ if __name__ == '__main__':
         config.lambda_hgr = int(float(args.hgr))
     if args.log_epoch is not None:
         config.log_epoch = int(float(args.log_epoch))
-
-
+    if args.walk_length is not None:
+        config.random_walk_length = args.walk_length
+    if args.num_walk is not None:
+        config.num_random_walk_sample = args.num_walk
+    print("DEVICE: ", config.device)
+    print("Train Epoch: ", config.train_epoch)
+    print("Train Size: ", config.train_size)
+    print("efl_gamma: ", config.efl_gamma)
+    print("lambda_hgr: ", config.lambda_hgr)
+    print("random_walk_length: ", config.random_walk_length)
+    print("num_random_walk_sample: ", config.num_random_walk_sample)
     if args.mode == "debug":
         run_model_debug(config)
         exit()
@@ -77,14 +89,37 @@ if __name__ == '__main__':
         for data in dataset:
             data.validate()
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
-        train(config, loader, dataset)
+        train(loader, dataset)
     elif args.mode == "test":
-        dataset = load_dataset(config,  args.dataset)
+        dataset = load_dataset(config, args.dataset)
         for i in range(len(dataset)):
             print(dataset[i])
         dataset = split_graph_train_val(dataset, config.train_size)
         loader = DataLoader(dataset, batch_size=1, shuffle=True)
-        train(config, loader)
+        train(loader, dataset)
+    elif args.mode == "grid":
+        dataset = load_dataset(config, args.dataset)
+        for data in dataset:
+            data.validate()
+        loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        grid_summary = ""
+        grid_df = pd.DataFrame(columns = ["trial_number","latent_dim","hidden_dim","fair_coef","val_acc","SDP","F1","EOD","ROC","S_acc"])
+        count = 0
+        for gcn_hidden in [16,32,64,128,256]:
+            for latent_dim in [16,32,64,128]:
+                    config.latent_dim_S = latent_dim
+                    config.latent_dim_Y = latent_dim
+                    config.gcn_hidden_dim = gcn_hidden
+                    config.efl_gamma = 1e4
+                    config.lambda_hgr = 1e4
+                    config.grid = 5000
+                    config.show()
+                    val_acc, spd, F1, eod, roc, S_acc = grid_search_train(loader, dataset)
+                    grid_summary += f"\nTRIAL {count}:\nLATENT DIMENSION: {latent_dim}\nGCN HIDDEN DIM: {gcn_hidden}\nFAIR COEFFICIENT: {1e4}\nRESULT:\tVal Acc: {val_acc}\tSPD: {spd}\t F1: {F1}\tEOD: {eod}\tROC: {roc}\tS_accuracy: {S_acc}"
+                    grid_df.loc[count] = [count, latent_dim, gcn_hidden, 1e4, val_acc, spd, F1, eod, roc, S_acc]
+                    count += 1
+                    print("--------------------DONE 1 GRID SEARCH LOOP---------------------")
+                    print(grid_summary)
+                    grid_df.to_csv("grid_result.csv", index=False)
     else:
-        print("mode should be one of [debug, train, test]")
-
+        print("mode should be one of [debug, train, test, grid]")

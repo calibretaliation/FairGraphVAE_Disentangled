@@ -10,14 +10,16 @@ import os, sys
 
 from tqdm import tqdm
 
-from config import Config
+from config import config
 import torch
 import numpy as np
 import torch
 import torch.nn.functional as F
 import networkx as nx
 from sklearn.cluster import SpectralClustering
-
+import logging
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%d/%m/%Y %I:%M:%S %p')
+logger = logging.getLogger(__name__)
 def generate_sample_graph(num_nodes, num_feats, num_labels):
     X = np.random.rand(num_nodes, num_feats)
     normalized_X = X / np.linalg.norm(X, axis=1, keepdims=True)
@@ -101,7 +103,7 @@ def fair_subgraph(node, neighbor_dict, sen_list, graph, num_sample=10, walk_leng
     print(f"DONE RANDOM WALK: {len(subgraph_nodes)} NODES, {edge_index.shape[1]} EDGES")
     return Data(x=graph['X'][list(subgraph_nodes)], edge_index=edge_index, y=graph['Y'][list(subgraph_nodes)], s=graph["S"][list(subgraph_nodes)], subgraph_nodes = torch.tensor(list(subgraph_nodes)))
 
-def fair_subgraph_concurrent(A, P, X, Y, S, device, L = 10, num_walks = 50):
+def fair_subgraph_concurrent(A, P, X, Y, S, device, L = config.random_walk_length, num_walks = config.num_random_walk_sample):
 
     A = torch.tensor(A, dtype=torch.float32, device=device)
     P = torch.tensor(P, dtype=torch.float32, device=device)
@@ -186,39 +188,48 @@ def custom_sample_cdf(cdf):
     # Use torch.searchsorted to find the indices efficiently
     next_nodes = torch.searchsorted(cdf, random_values.unsqueeze(1), right=False).squeeze(1)
     return next_nodes
-def fair_subgraph_concurrent_with_batch(A, P, X, Y, S, device, L = 10, num_walks = 50):
 
+def fair_subgraph_concurrent_with_batch(A, P, X, Y, S, L = config.random_walk_length, num_walks = config.num_random_walk_sample):
+    logger.info(f"Moving A and P to tensor")
+    device = config.device
     A = torch.tensor(A, dtype=torch.float32, device=device)
     P = torch.tensor(P, dtype=torch.float32, device=device)
     row_sums = P.sum(dim=1, keepdim=True)
     zero_row_mask = row_sums == 0
 
+    logger.info(f"Create self loop for P to avoid out of index")
     # For nodes with no outgoing edges, create self-loops
     P[zero_row_mask.squeeze(), :] = 0
     P[zero_row_mask.squeeze(), zero_row_mask.squeeze()] = 1.0
+
     # Normalize P to ensure each row sums to 1
     row_sums = P.sum(dim=1, keepdim=True)
     P = P / row_sums
+    logger.info(f"Done normalizing P")
 
     num_nodes = A.shape[0]
 
     # Precompute cumulative sums of the transition probabilities
+    logger.info(f"Calculating cumulative sum of probability")
     P_cumsum = torch.cumsum(P, dim=1)  # Shape: (n, n)
     P_cumsum[:, -1] = 1.0
 
-    batch_size = 200
+    batch_size = config.batch_size
     subgraphs = []
-
+    logger.info(f"Start batching, batch size = {batch_size}")
     accumulated_nodes = defaultdict(set)  # Key: node ID, Value: set of node IDs visited
     accumulated_edges = defaultdict(set)
+    count = 0
     for batch_start in tqdm(range(0, num_nodes, batch_size), position = 0, desc="Nodes", leave=False, colour="red"):
         batch_end = min(batch_start + batch_size, num_nodes)
         batch_indices = torch.arange(batch_start, batch_end, device=device)
         batch_size_actual = len(batch_indices)
+        logger.info(f"Start processing nodes, from {batch_start} to {batch_end}")
 
         # Initialize walks for the batch
         walks_batch = torch.zeros((len(batch_indices), num_walks, L + 1), dtype=torch.long, device=device)
         walks_batch[:, :, 0] = batch_indices.unsqueeze(1)
+        logger.info(f"Start walking, length: {L}")
         for t in tqdm(range(1, L + 1), position = 1, desc="Walk length", leave=False, colour="green"):
             current_nodes = walks_batch[:, :, t - 1]  # Shape: (batch_size_actual, num_walks)
             current_nodes_flat = current_nodes.reshape(-1)
@@ -246,44 +257,44 @@ def fair_subgraph_concurrent_with_batch(A, P, X, Y, S, device, L = 10, num_walks
                 edges = torch.sort(edges, dim=1)[0]
                 edges_unique = torch.unique(edges, dim=0)
 
-                # Collect edges from all walks
-                # for walk in walks_i:
-                #     u = walk[:-1]
-                #     v = walk[1:]
-                #     edges = torch.stack((u, v), dim=1)
-                #     # Convert edges to sorted tuples to represent undirected edges
-                #     edges = torch.sort(edges, dim=1)[0]
-                #     # Convert to list of tuples and add to set
-                #     edges_set.update([tuple(edge.cpu().numpy()) for edge in edges])
-                nodes_in_walk_np = nodes_in_walk.cpu().numpy()
-
                 # Map the edges to the new node IDs
                 edges_np = edges_unique.cpu().numpy()
                 accumulated_edges[i.cpu().item()].update([tuple(edge) for edge in edges_np])
-            for i in range(num_nodes):
-                # Get accumulated nodes and edges for node i
-                nodes_in_walk = np.array(list(accumulated_nodes[i]))
-                edges_set = accumulated_edges[i]
-                num_nodes_in_subgraph = len(nodes_in_walk)
-                mapping = {old_id: new_id for new_id, old_id in enumerate(nodes_in_walk)}
+                del walks_i, u, v, edges, edges_np
+            del current_nodes, current_nodes_flat, cdf, next_nodes_flat, next_nodes
+            torch.cuda.empty_cache()
+    for i in range(num_nodes):
+        # Get accumulated nodes and edges for node i
+        nodes_in_walk = np.array(list(accumulated_nodes[i]))
+        edges_set = accumulated_edges[i]
+        num_nodes_in_subgraph = len(nodes_in_walk)
+        mapping = {old_id: new_id for new_id, old_id in enumerate(nodes_in_walk)}
 
-                # Map edges to new node IDs
-                edges_np = np.array(list(edges_set))
-                edges_mapped = np.array([[mapping[u], mapping[v]] for u, v in edges_np])
-                edge_index = edges_mapped.T
-                # Transpose edges to get edge_index format if needed
-                X_sub= X[nodes_in_walk]
-                Y_sub = Y[nodes_in_walk]
-                S_sub = S[nodes_in_walk]
+        # Map edges to new node IDs
+        edges_np = np.array(list(edges_set))
+        edges_mapped = np.array([[mapping[u], mapping[v]] for u, v in edges_np])
+        edge_index = edges_mapped.T
+        # Transpose edges to get edge_index format if needed
+        X_sub= X[nodes_in_walk]
+        Y_sub = Y[nodes_in_walk]
+        S_sub = S[nodes_in_walk]
+        if num_nodes_in_subgraph < 5:
+            logger.info(f"Skipping small subgraph, num nodes = {num_nodes_in_subgraph}")
+            count += 1
+            continue
+        else:
+            logger.info(
+                f"Created subgraph:\nNum nodes:\t{num_nodes_in_subgraph}\nNum edges:\t{edge_index.shape}")
 
-                subgraphs.append({
-                    'nodes': torch.tensor(np.arange(num_nodes_in_subgraph), dtype=torch.float32, device=device),
-                    'edge_index': torch.tensor(edge_index, dtype=torch.int64, device=device),
-                    'mapping': mapping,
-                    'X': X_sub,
-                    "Y": Y_sub,
-                    'S': S_sub
-                })
+            subgraphs.append({
+            'nodes': torch.tensor(np.arange(num_nodes_in_subgraph), dtype=torch.float32),
+            'edge_index': torch.tensor(edge_index, dtype=torch.int64),
+            'mapping': mapping,
+            'X': X_sub,
+            "Y": Y_sub,
+            'S': S_sub
+        })
+    logger.info(f"DONE SUBGRAPHING, TOTAL GRAPH: {len(subgraphs)}, SKIPPED: {count}")
     return subgraphs
 class GraphDataset(InMemoryDataset):
     def __init__(self, root, dataset_name, transform=None, pre_transform=None):
@@ -319,7 +330,9 @@ class GraphDataset(InMemoryDataset):
                     data_list.append(data)
             else:
                 print("Loading Graph...")
+                logger.info(f"Loading original graph")
                 graph = read_graphs(raw_path, "pt")
+                logger.info(f"Original graph:\nNum nodes:\t{graph['X'].shape}\nNum labels:\t{graph['Y'].unique(return_counts=True)}\nNum Sensitive Attributes:\t{graph['S'].unique(return_counts=True)}")
                 device = "cuda:1"
                 neighbor_dict = defaultdict(set)
                 for src, dst in zip(graph['edge_index'][0], graph['edge_index'][1]):
@@ -327,12 +340,16 @@ class GraphDataset(InMemoryDataset):
                     dst = int(dst.data.cpu())
                     neighbor_dict[src].add(dst)
                     neighbor_dict[dst].add(src)
+                logger.info(f"Contructed neighbor_dict for transfer probability")
                 network = construct_A_from_edge_index(graph['edge_index'], len(graph['X']))
                 print("Creating subgraphs...")
+                logger.info(f"Calculating transfer probability")
                 P = [fair_transfer_probability(list(neighbor_dict[node]), graph["S"].data.cpu().numpy()) for node in
                      neighbor_dict.keys()]
                 subgraphs = []
-                new_subgraphs = fair_subgraph_concurrent_with_batch(network, P, graph["X"], graph["Y"], graph["S"], device = device)
+                logger.info(f"Subgraphing...")
+                new_subgraphs = fair_subgraph_concurrent_with_batch(network, P, graph["X"], graph["Y"], graph["S"])
+
                 print("Processing subgraphs...")
                 for subgraph in new_subgraphs:
                     data_sub = split_graph_train_val(Data(x=subgraph['X'], edge_index=subgraph['edge_index'], y=subgraph['Y'], s=subgraph['S']))
@@ -344,6 +361,7 @@ class GraphDataset(InMemoryDataset):
             subgraphs = [data_sub for data_sub in subgraphs if self.pre_filter(data_sub)]
 
         data_sub, slices = self.collate(subgraphs)
+        logger.info(f"Saving processed data !!!!!")
         torch.save((data_sub, slices), self.processed_paths[0])
 
 def load_nba_data(config):
@@ -572,9 +590,46 @@ def load_bail_data(config):
     result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
     print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
     return result
-def load_dataset(config: Config, dataset = "nba"):
-    assert dataset in ['generate','nba','german', 'credit',"pokecz", 'bail'], \
-    "dataset parameter should be one of: ['generate','nba','german', 'credit','pokecz','bail']"
+
+def load_pokecn_data(config):
+    dataset_name = "pokecn"
+    pokecn = pd.read_csv(config.data_path + "/{}".format(dataset_name) + "/region_job.csv")
+    pokecn["I_am_working_in_field"] = pokecn["I_am_working_in_field"].apply(lambda x: int(float(x == -1)))
+    pokecn["region"].value_counts()
+    pokecn_label = pokecn['I_am_working_in_field'].values.astype(np.float32).reshape(-1, 1)
+    # Extract sensitive matrix from 'Gender' column
+    pokecn_sensitive = pokecn['region'].values.astype(np.float32).reshape(-1, 1)
+    feature_columns = pokecn.drop(columns=['I_am_working_in_field', 'region', 'user_id'])
+    pokecn_node_feature = feature_columns.values.astype(np.float32)
+    network = np.zeros((len(pokecn_node_feature), len(pokecn_node_feature)))
+    node_dict = {user: id for id, user in enumerate(pokecn['user_id'])}
+
+    with open(config.data_path + "/{}".format(dataset_name) + "/region_job_relationship.txt", "r") as file:
+        line = file.readline()
+        while line:
+            line = line.rstrip("\n")
+            line = list(map(lambda x: int(float(x)), line.split('\t')))
+            network[node_dict[line[0]], node_dict[line[1]]] = 1
+            network[node_dict[line[1]], node_dict[line[0]]] = 1
+            line = file.readline()
+    dataset = {}
+    dataset["edge_index"] = torch.nonzero(torch.Tensor(network).float(), as_tuple=False).t()
+    dataset["Y"] = torch.tensor(pokecn_label)
+    dataset["X"] = min_max_scale_features(torch.tensor(pokecn_node_feature))
+    dataset["S"] = min_max_scale_features(torch.tensor(pokecn_sensitive))
+    config.num_nodes = pokecn_node_feature.shape[0]
+    config.num_feats = pokecn_node_feature.shape[1]
+    config.num_sensitive_class = len(np.unique(pokecn_sensitive))
+    config.num_labels = 2
+    config.dataset_name = "pokecn"
+    save_graphs(dataset, config.data_path + "/{}/raw/{}.pt".format(dataset_name, dataset_name), "pt")
+    result = GraphDataset(root=config.data_path + "/{}".format(dataset_name), dataset_name=dataset_name)
+    print(f"DONE!\nDATASET: {config.dataset_name}\nNUM NODES: {config.num_nodes}\nNUM FEATS: {config.num_feats}")
+    return result
+
+def load_dataset(config, dataset = "nba"):
+    assert dataset in ['generate','nba','german', 'credit',"pokecz", 'bail',"pokecn"], \
+    "dataset parameter should be one of: ['generate','nba','german', 'credit','pokecz','bail','pokecn']"
     if not os.path.exists(config.data_path + "/{}/raw".format(dataset)):
         os.mkdir(config.data_path + "/{}/raw".format(dataset))
 
@@ -593,15 +648,41 @@ def load_dataset(config: Config, dataset = "nba"):
         save_graphs(graph_list, config.data_path + "/{}/raw/{}.pt".format(dataset, dataset), "pt")
         dataset = GraphDataset(root=config.data_path + "/{}".format(dataset), dataset_name=dataset)
     elif dataset == "nba":
+        handler = logging.FileHandler(f'log/data_nba.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
         dataset = load_nba_data(config)
     elif dataset == "german":
+        handler = logging.FileHandler(f'log/data_german.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
         dataset = load_german_data(config)
     elif dataset == "credit":
+        handler = logging.FileHandler(f'log/data_credit.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
         dataset = load_credit_data(config)
     elif dataset == "pokecz":
+        handler = logging.FileHandler(f'log/data_pokecz.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
         dataset = load_pokecz_data(config)
     elif dataset == "bail":
+        handler = logging.FileHandler(f'log/data_bail.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
         dataset = load_bail_data(config)
+    elif dataset == "pokecn":
+        handler = logging.FileHandler(f'log/data_pokecn.log')
+        handler.setFormatter(log_format)
+        logger.addHandler(handler)
+        logger.propagate = False
+        dataset = load_pokecn_data(config)
     return dataset
 def split_data_train_val(dataset, config):
     train_size = int(config.train_size * len(dataset))  # 80% for training
