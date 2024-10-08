@@ -40,9 +40,9 @@ parser.add_argument("--num_epoch", default=10001,
                     help="Train epoch config")
 parser.add_argument("--train_size", default=0.8,
                     help="Train size for split config")
-parser.add_argument("--efl", default=10000,
+parser.add_argument("--efl", default=1,
                     help="EFL coefficient for fair loss")
-parser.add_argument("--hgr", default=10000,
+parser.add_argument("--hgr", default=1,
                     help="HGR coefficient for u_Y and S in dependence")
 parser.add_argument("--log_epoch", default=10,
                     help="Number of epochs per evaluation")
@@ -103,20 +103,18 @@ if __name__ == '__main__':
             data.validate()
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
         grid_summary = ""
-        grid_df = pd.DataFrame(columns = ["trial_number","latent_dim","hidden_dim","fair_coef","val_acc","SDP","F1","EOD","ROC","S_acc"])
+        grid_df = pd.DataFrame(columns = ["trial_number","efl", "hgr","val_acc","SDP","F1","EOD","ROC","S_acc"])
         count = 0
-        for gcn_hidden in [16,32,64,128,256]:
-            for latent_dim in [16,32,64,128]:
-                    config.latent_dim_S = latent_dim
-                    config.latent_dim_Y = latent_dim
-                    config.gcn_hidden_dim = gcn_hidden
-                    config.efl_gamma = 1e4
-                    config.lambda_hgr = 1e4
-                    config.grid = 5000
+        for efl in [-1e4,-1e2,0,1e2,1e4]:
+            for hgr in [-1e4,-1e2,0,1e2,1e4]:
+                    config.efl_gamma = efl
+                    config.lambda_hgr = hgr
+                    # config.gcn_hidden_dim = gcn_hidden
+                    config.grid = 10000
                     config.show()
-                    val_acc, spd, F1, eod, roc, S_acc = grid_search_train(loader, dataset)
-                    grid_summary += f"\nTRIAL {count}:\nLATENT DIMENSION: {latent_dim}\nGCN HIDDEN DIM: {gcn_hidden}\nFAIR COEFFICIENT: {1e4}\nRESULT:\tVal Acc: {val_acc}\tSPD: {spd}\t F1: {F1}\tEOD: {eod}\tROC: {roc}\tS_accuracy: {S_acc}"
-                    grid_df.loc[count] = [count, latent_dim, gcn_hidden, 1e4, val_acc, spd, F1, eod, roc, S_acc]
+                    val_acc, spd, F1, eod, roc, S_acc = grid_search_train(loader, dataset, count)
+                    grid_summary += f"\nTRIAL {count}:\nEFL: {efl}\nHGR: {hgr}\nRESULT:\tVal Acc: {val_acc}\tSPD: {spd}\t F1: {F1}\tEOD: {eod}\tROC: {roc}\tS_accuracy: {S_acc}"
+                    grid_df.loc[count] = [count, efl, hgr, val_acc, spd, F1, eod, roc, S_acc]
                     count += 1
                     print("--------------------DONE 1 GRID SEARCH LOOP---------------------")
                     print(grid_summary)

@@ -1,6 +1,7 @@
 from collections import defaultdict
 
 import pandas as pd
+from matplotlib import pyplot as plt
 from scipy.io import loadmat, savemat
 from sklearn.model_selection import train_test_split
 from torch.utils.data import random_split
@@ -333,7 +334,6 @@ class GraphDataset(InMemoryDataset):
                 logger.info(f"Loading original graph")
                 graph = read_graphs(raw_path, "pt")
                 logger.info(f"Original graph:\nNum nodes:\t{graph['X'].shape}\nNum labels:\t{graph['Y'].unique(return_counts=True)}\nNum Sensitive Attributes:\t{graph['S'].unique(return_counts=True)}")
-                device = "cuda:1"
                 neighbor_dict = defaultdict(set)
                 for src, dst in zip(graph['edge_index'][0], graph['edge_index'][1]):
                     src = int(src.data.cpu())
@@ -761,3 +761,56 @@ def min_max_scale_features(X, min_val=0.0, max_val=1.0):
     X_scaled = (X - X_min) / (X_max - X_min)
     X_scaled = X_scaled * (max_val - min_val) + min_val
     return X_scaled
+def plot_loss_dict(data, config, trial):
+    rows, cols = 5, 5  # 2x5 grid
+
+    # Create subplots
+    fig, axes = plt.subplots(rows, cols, figsize=(30, 16))  # Adjust figsize as needed
+    axes = axes.flatten()  # Flatten to easily iterate
+
+    # Define the step size for averaging
+    step_size = 100  # Average over every 10 steps
+
+    # Plot each key in a separate subplot
+    for idx, (key, values) in enumerate(data.items()):
+        ax = axes[idx]
+        # Convert values to a NumPy array for easier manipulation
+        if isinstance(values, torch.Tensor):
+            values = values.numpy()
+        else:
+            values = np.array(values)
+
+        total_epochs = len(values)
+        if len(values) > 10000:
+            step_size = 100
+        else:
+            step_size = 1
+        num_chunks = total_epochs // step_size  # Number of full chunks of size 10
+        # Truncate the values to fit into an integer number of chunks
+        values_truncated = values[:num_chunks * step_size]
+
+        # Reshape the array to have shape (num_chunks, step_size)
+        values_reshaped = values_truncated.reshape(num_chunks, step_size)
+
+        # Compute the average over each chunk (axis=1 computes mean across columns)
+        values_avg = values_reshaped.mean(axis=1)
+
+        # Create x-values corresponding to the middle of each chunk
+        x_values = np.arange(1, num_chunks + 1) * step_size - (step_size // 2)
+
+        # Plot the averaged values
+        ax.plot(x_values, values_avg, linestyle='-')
+        ax.set_title(f"Key: {key}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Value")
+        ax.grid(True)
+
+    # Hide any unused subplots (if any)
+    for idx in range(len(data), rows * cols):
+        fig.delaxes(axes[idx])
+    plt.title(f"Trial {trial}, EFL = {config.efl_gamma}, HGR = {config.lambda_hgr}")
+    # Adjust layout for better spacing
+    plt.tight_layout()
+
+    # Save the figure to a file (uncomment if needed)
+    plt.savefig(f"figures/loss_dict_{config.dataset_name}_{trial}.png", dpi=300)

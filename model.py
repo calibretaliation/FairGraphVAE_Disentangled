@@ -11,6 +11,8 @@ from torch import optim
 import torch.nn.functional as F
 import torch.nn.init as init
 import sys,os
+
+from torch.nn import BatchNorm1d
 from torch_geometric.nn import GCNConv
 from scipy.linalg import eigh
 from torch_geometric.profile.benchmark import require_grad
@@ -24,90 +26,126 @@ class U_S_encoder(nn.Module):
         self.conv1 = GCNConv(in_channels=config.num_feats, out_channels=config.gcn_hidden_dim)
         self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S)
         self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_S)
-
+        self.bn = BatchNorm1d(config.latent_dim_S)
     def forward(self, x, edge_index):
 
-        x = self.conv1(x, edge_index).relu()
-        return self.conv_mu(x, edge_index), F.softplus(self.conv_logstd(x, edge_index))
+        x = self.conv1(x, edge_index)
+        x = self.bn(x)
+        x = x.relu()
+        return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 class U_Y_encoder(nn.Module):
     def __init__(self, config):
         super(U_Y_encoder, self).__init__()
         self.conv1 = GCNConv(in_channels=config.num_feats+1, out_channels=config.gcn_hidden_dim)
         self.conv_mu = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y)
         self.conv_logstd = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.latent_dim_Y)
+        self.bn = BatchNorm1d(config.latent_dim_Y)
 
     def forward(self, x, edge_index, Y):
         x = torch.cat((x,Y), dim=1)
-        x = self.conv1(abs(x), edge_index).relu()
-        return self.conv_mu(x, edge_index), F.softplus(self.conv_logstd(x, edge_index))
+        x = self.conv1(abs(x), edge_index)
+        x = self.bn(x)
+        x = x.relu()
+        return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
-class S_decoder(nn.Module):
+class S_classify(nn.Module):
     def __init__(self, config):
-        super(S_decoder, self).__init__()
+        super(S_classify, self).__init__()
+        self.config = config
         self.gconv1_S = GCNConv(in_channels=config.latent_dim_S, out_channels=config.gcn_hidden_dim).to(config.device)
-        self.gconv2_S = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=1).to(config.device)
+        self.gconv2_S = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=2).to(config.device)
+
         self.sigmoid = nn.Sigmoid()
     def forward(self, x, edge_index):
 
-        x = self.gconv1_S(abs(x), edge_index).relu()
-        x = self.gconv2_S(x, edge_index).relu()
-        return self.sigmoid(x)
+        x = self.gconv1_S(x, edge_index)
+        x = self.gconv2_S(x, edge_index)
+        # x = x.detach()
+        x = gumbel_softmax(x, self.config.gumbel_temp)
+        # x = self.sigmoid(x)
+        return x
 
 class A_decoder(nn.Module):
     def __init__(self, config):
         super(A_decoder, self).__init__()
         self.config = config
-        self.sigmoid = nn.Sigmoid()
+
+
     def forward(self, u_S, u_Y):
 
         feat = torch.cat((u_S, u_Y), dim=1)
         raw_scores = torch.matmul(feat, feat.T)
+        adj_logits_upper = torch.triu(raw_scores, diagonal=1)
+        adj_recon_upper = gumbel_softmax(adj_logits_upper, self.config.gumbel_temp)
+        adj_prob= adj_recon_upper + adj_recon_upper.t()
         # Apply sigmoid to get probabilities
-        adj_prob = torch.sigmoid(raw_scores)
-        # Enforce symmetry
-        adj_prob = 0.5 * (adj_prob + adj_prob.T)
+        # adj_prob = torch.sigmoid(raw_scores)
+        # # Enforce symmetry
+        # adj_prob = 0.5 * (adj_prob + adj_prob.T)
         A = (adj_prob > 0.5).float()
         # A = recover_adj_lower(self.sigmoid(l), self.config)
-        n = A.size(0)
-        row_indices, col_indices = torch.tril_indices(row=n, col=n, offset=0)
-        l = A[row_indices, col_indices].flatten()
+        # n = A.size(0)
+        l = adj_prob.flatten()
         return A, l
 class X_decoder(nn.Module):
     def __init__(self, config):
         super(X_decoder, self).__init__()
         self.gconv1_X = GCNConv(in_channels=config.latent_dim_S+config.latent_dim_Y, out_channels=config.gcn_hidden_dim).to(config.device)
-        self.gconv2_X = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.num_feats).to(
-            config.device)
-        self.softmax = nn.Softmax()
+        self.gconv2_X = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=config.num_feats).to(config.device)
 
+        self.bn1 = nn.BatchNorm1d(config.gcn_hidden_dim)
+        self.bn2 = nn.BatchNorm1d(config.num_feats)
     def forward(self, edge_index, u_S, u_Y):
         latent = torch.cat((u_S, u_Y), dim=1)
-        X = self.gconv1_X(abs(latent), edge_index).relu()
+        X = self.gconv1_X(latent, edge_index)
+        X = self.bn1(X)
+        X = X.relu()
         X = self.gconv2_X(X, edge_index)
+        X = self.bn2(X)
         return X
 class Y_prime_decoder(nn.Module):
     def __init__(self, config):
         super(Y_prime_decoder, self).__init__()
-        self.gconv1_Y_prime = GCNConv(in_channels=config.num_feats, out_channels=512).to(config.device)
-        self.gconv2_Y_prime = GCNConv(in_channels=512, out_channels=2).to(config.device)
+        self.gconv1_Y_prime = GCNConv(in_channels=config.num_feats, out_channels=config.gcn_hidden_dim).to(config.device)
+        self.gconv2_Y_prime = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=2).to(config.device)
         self.softmax = nn.Softmax()
     def forward(self, X, edge_index):
-        Y_prime = self.gconv1_Y_prime(X, edge_index).relu()
+        Y_prime = self.gconv1_Y_prime(X, edge_index)
         Y_prime = self.gconv2_Y_prime(Y_prime, edge_index)
-
+        Y_prime = Y_prime.detach()
         return self.softmax(Y_prime)
 class Y_decoder(nn.Module):
     def __init__(self, config):
         super(Y_decoder, self).__init__()
-        self.gconv1_Y = GCNConv(in_channels=config.num_feats + config.latent_dim_Y, out_channels=512).to(config.device)
-        self.gconv2_Y = GCNConv(in_channels=512, out_channels=2).to(config.device)
+        self.gconv1_Y = GCNConv(in_channels=config.num_feats + config.latent_dim_Y, out_channels=config.gcn_hidden_dim).to(config.device)
+        self.gconv2_Y = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=2).to(config.device)
         self.softmax = nn.Softmax()
+        self.bn1 = nn.BatchNorm1d(config.gcn_hidden_dim)
+        self.bn2 = nn.BatchNorm1d(2)
     def forward(self, edge_index, X, u_Y):
         latent = torch.cat((u_Y, X), dim=1)
-        Y = self.gconv1_Y(latent, edge_index).relu()
+        Y = self.gconv1_Y(latent, edge_index)
+        Y = self.bn1(Y)
+        Y = Y.relu()
         Y = self.gconv2_Y(Y, edge_index)
-
+        Y = self.bn2(Y)
         return self.softmax(Y)
+class S_decoder(nn.Module):
+    def __init__(self, config):
+        super(S_decoder, self).__init__()
+        self.gconv1_S = GCNConv(in_channels=config.latent_dim_S, out_channels=config.gcn_hidden_dim).to(config.device)
+        self.gconv2_S = GCNConv(in_channels=config.gcn_hidden_dim, out_channels=2).to(config.device)
+        self.softmax = nn.Softmax()
+        self.bn1 = nn.BatchNorm1d(config.gcn_hidden_dim)
+        self.bn2 = nn.BatchNorm1d(2)
+    def forward(self, edge_index, u_S):
+        S = self.gconv1_S(u_S, edge_index)
+        S = self.bn1(S)
+        S = S.relu()
+        S = self.gconv2_S(S, edge_index)
+        S = self.bn2(S)
+        return nn.Sigmoid()(S), self.softmax(S)
+
 class GraphVAE(nn.Module):
     '''
     Notations:
@@ -122,93 +160,21 @@ class GraphVAE(nn.Module):
         self.config = config
         self.u_S_encoder = U_S_encoder(config)
         self.u_Y_encoder = U_Y_encoder(config)
-        self.S_decoder = S_decoder(config)
         self.X_decoder = X_decoder(config)
         self.A_decoder = A_decoder(config)
         self.Y_decoder = Y_decoder(config)
-        self.Y_prime_decoder = Y_prime_decoder(config)
         self.S_decoder = S_decoder(config)
 
         for m in self.modules():
             if isinstance(m, torch_geometric.nn.GCNConv):
-                torch.nn.init.xavier_uniform_(m.lin.weight)
+                torch.nn.init.kaiming_uniform_(m.lin.weight, nonlinearity='relu')
 
-    def recon_edge_loss(self, l, A, num_nodes):
-        A = construct_A_from_edge_index(A, num_nodes)
-        l_original = A[np.triu_indices_from(A)].to(self.config.device)
-        edge_loss =nn.MSELoss()(l, l_original)*1e4
-        return edge_loss
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps.mul(std).add_(mu)
 
-    def loss_function(self,
-                      X_pred,
-                      Y_pred,
-                      X_true,
-                      Y_true,
-                      Y_prime,
-                      logvar_u_Y,
-                      mu_u_Y,
-                      logvar_u_S,
-                      mu_u_S,
-                      edge_index,
-                      l,
-                      u_S,
-                      u_Y,
-                      idx):
 
-        num_nodes = len(Y_true)
-        # S_recon_loss = self.S_recon_loss(S_hat)
-        # Y_pred, _ = torch.max(Y_pred[idx], dim=1, keepdim=True)
-        # Y_prime, _ = torch.max(Y_prime[idx], dim=1, keepdim=True)
-        Y_true[Y_true != 1] = 0
-        Y_true = torch.nn.functional.one_hot(Y_true.long(), num_classes=2).squeeze()
-        # Y_prime = Y_prime.argmax(dim=1).unsqueeze(1)[idx]
-        Y_recon_loss = abs(nn.MSELoss()(Y_pred[idx].float(), Y_true[idx].float())
-                        + nn.MSELoss()(Y_pred[idx].float(), Y_prime[idx].float())
-                        )
-
-        # 2. Reconstruction Loss for X (log P(X | U_S, A, U_Y))
-        X_recon_loss = F.mse_loss(X_pred[idx].float(), X_true[idx].float())
-
-        A_recon_loss = self.recon_edge_loss(l, edge_index, num_nodes)
-
-        # 4. KL Divergence for U_Y (KL(Q(U_Y | X, A, Y) || P(U_Y)))
-        kl_u_y = -0.5 * torch.sum(1 + logvar_u_Y - mu_u_Y.pow(2) - logvar_u_Y.exp() + 1e-8)
-
-        # 5. KL Divergence for U_S (KL(Q(U_S | X, A) || P(U_S)))
-        kl_u_s = -0.5 * torch.sum(1 + logvar_u_S - mu_u_S.pow(2) - logvar_u_S.exp() + 1e-8)
-
-        # 6. HGR Regularization Term (lambda * HGR(U_S, Y))
-        hgr_term = -self.config.lambda_hgr * hgr_correlation(u_S, u_Y)
-        # ELBO is the sum of all these terms
-        if math.isnan(kl_u_s) or math.isnan(kl_u_y):
-            print(f"X_pred : {X_pred}")
-            print(f"Y_pred : {Y_pred}")
-            print(f"X_true : {X_true}")
-            print(f"Y_prime : {Y_prime}")
-            print(f"logvar_u_Y : {logvar_u_Y}")
-            print(f"mu_u_Y : {mu_u_Y}")
-            print(f"logvar_u_S : {logvar_u_S}")
-            print(f"mu_u_S : {mu_u_S}")
-            print(f"edge_index : {edge_index}")
-            print(f"l : {l}")
-            print(f"u_S : {u_S}")
-            print(f"u_Y : {u_Y}")
-            print(f"kl_u_y loss: {kl_u_y}")
-            print(f"kl_u_s loss: {kl_u_s}")
-            print(f"A_recon_loss loss: {A_recon_loss}")
-            print(f"X_recon_loss loss: {X_recon_loss}")
-            print(f"Y_recon_loss loss: {Y_recon_loss}")
-            exit()
-        elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + kl_u_y + kl_u_s
-                + hgr_term
-                # + efl_term + S_recon_loss
-                )
-
-        return elbo, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term
     def forward(self, X, edge_index, Y, idx):
         assert edge_index.max().item() <= len(X)
 
@@ -216,14 +182,11 @@ class GraphVAE(nn.Module):
         mu_Y, logvar_Y = self.u_Y_encoder(X,edge_index,Y)
         u_S = self.reparameterize(mu_S,logvar_S)
         u_Y = self.reparameterize(mu_Y,logvar_Y)
-        Y_prime = self.Y_prime_decoder(X,edge_index).detach()
         A_new, l = self.A_decoder(u_S, u_Y)
         X_new = self.X_decoder(edge_index, u_S, u_Y)
         Y_new = self.Y_decoder(edge_index, u_Y, X)
-        loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term = self.loss_function(X_new, Y_new, X, Y,Y_prime , logvar_Y, mu_Y, logvar_S, mu_S, edge_index, l, u_S, u_Y, idx)
-        return (loss, Y_recon_loss, X_recon_loss, A_recon_loss, kl_u_y, kl_u_s, hgr_term,
-                Y_new,
-                u_S)
+        S_logits, S_new = self.S_decoder(edge_index, u_S)
+        return mu_S, logvar_S, mu_Y, logvar_Y, u_S, u_Y, A_new, l, X_new, Y_new, S_new, S_logits
 class F_1_U_S(nn.Module):
     '''
     Notations:
@@ -310,5 +273,89 @@ def S_recon_loss(S_hat, S_true):
     # # Compute the entropy loss
     # entropy_loss = - torch.sum(p_s1 * torch.log(p_s1 + 1e-8) + p_s0 * torch.log(p_s0 + 1e-8))
     #
-    loss = nn.MSELoss()(S_hat, S_true)
+    loss = nn.NLLLoss()(torch.log(S_hat), S_true.squeeze().long())
     return loss
+def gumbel_softmax(logits, temperature):
+    # Sample from Gumbel Distribution
+    noise = torch.rand_like(logits)
+    gumbel_noise = -torch.log(-torch.log(noise + 1e-9) + 1e-9)
+    y = logits + gumbel_noise
+    return F.softmax(y / temperature, dim=-1)
+def loss_function(config,
+                  X_pred,
+                  Y_pred,
+                  S_new,
+                  X_true,
+                  Y_true,
+                  S_true,
+                  logvar_u_Y,
+                  mu_u_Y,
+                  logvar_u_S,
+                  mu_u_S,
+                  edge_index,
+                  l,
+                  u_S,
+                  u_Y,
+                  idx):
+
+    num_nodes = len(Y_true)
+    # S_recon_loss = self.S_recon_loss(S_hat)
+    # Y_pred, _ = torch.max(Y_pred[idx], dim=1, keepdim=True)
+    # Y_prime, _ = torch.max(Y_prime[idx], dim=1, keepdim=True)
+    Y_true[Y_true != 1] = 0
+    Y_true = torch.nn.functional.one_hot(Y_true.long(), num_classes=2).squeeze()
+    # Y_prime = Y_prime.argmax(dim=1).unsqueeze(1)[idx]
+    Y_recon_loss = abs(nn.MSELoss()(Y_pred[idx].float(), Y_true[idx].float()))
+
+    # 2. Reconstruction Loss for X (log P(X | U_S, A, U_Y))
+    X_recon_loss = nn.MSELoss()(X_pred[idx].float(), X_true[idx].float())
+
+    A_recon_loss = recon_edge_loss(config, l, edge_index, num_nodes)
+    S_recon_loss = S_decoder_loss(S_new, S_true, mu_u_S, logvar_u_S, u_S)
+    # 4. KL Divergence for U_Y (KL(Q(U_Y | X, A, Y) || P(U_Y)))
+    kl_u_y = -0.5 * torch.sum(1 + logvar_u_Y - mu_u_Y.pow(2) - logvar_u_Y.exp() + 1e-8)/num_nodes
+
+    # 5. KL Divergence for U_S (KL(Q(U_S | X, A) || P(U_S)))
+    kl_u_s = -0.5 * torch.sum(1 + logvar_u_S - mu_u_S.pow(2) - logvar_u_S.exp() + 1e-8)/num_nodes
+
+    # 6. HGR Regularization Term (lambda * HGR(U_S, Y))
+    # ELBO is the sum of all these terms
+    if math.isnan(kl_u_s) or math.isnan(kl_u_y):
+        print(f"X_pred : {X_pred}")
+        print(f"Y_pred : {Y_pred}")
+        print(f"X_true : {X_true}")
+        print(f"logvar_u_Y : {logvar_u_Y}")
+        print(f"mu_u_Y : {mu_u_Y}")
+        print(f"logvar_u_S : {logvar_u_S}")
+        print(f"mu_u_S : {mu_u_S}")
+        print(f"edge_index : {edge_index}")
+        print(f"l : {l}")
+        print(f"u_S : {u_S}")
+        print(f"u_Y : {u_Y}")
+        print(f"kl_u_y loss: {kl_u_y}")
+        print(f"kl_u_s loss: {kl_u_s}")
+        print(f"A_recon_loss loss: {A_recon_loss}")
+        print(f"X_recon_loss loss: {X_recon_loss}")
+        print(f"Y_recon_loss loss: {Y_recon_loss}")
+        exit()
+    elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + S_recon_loss + kl_u_y + kl_u_s            )
+
+    return elbo, Y_recon_loss, X_recon_loss, A_recon_loss, S_recon_loss, kl_u_y, kl_u_s
+def recon_edge_loss(config, l, A, num_nodes):
+    A = construct_A_from_edge_index(A, num_nodes)
+    l_original = A.flatten().to(config.device)
+    edge_loss = F.mse_loss(l, l_original, reduction='mean')
+    return edge_loss
+def S_decoder_loss(s_recon, s_true, mu_S, logvar_S, u_S):
+    s_true = torch.nn.functional.one_hot(s_true.long(), num_classes=2).squeeze().float()
+    recon_loss = F.mse_loss(s_recon, s_true, reduction='mean')
+    log_p_s = -0.5 * torch.sum(u_S ** 2 + torch.log(2 * torch.pi * torch.ones_like(u_S)))
+
+    # Compute log Q(S|X,A)
+    log_q_s_given_xa = -0.5 * torch.sum(
+        ((u_S - mu_S) ** 2) / torch.exp(logvar_S) + logvar_S + torch.log(2 * torch.pi * torch.ones_like(u_S)))
+
+    # ELBO Loss
+    elbo = log_p_s - log_q_s_given_xa
+    total_loss = -elbo + recon_loss
+    return total_loss
