@@ -319,6 +319,7 @@ def loss_function(config,
     kl_u_s = -0.5 * torch.sum(1 + logvar_u_S - mu_u_S.pow(2) - logvar_u_S.exp() + 1e-8)/num_nodes
 
     # 6. HGR Regularization Term (lambda * HGR(U_S, Y))
+    hgr_term = config.lambda_hgr * hgr_correlation(u_S, u_Y)
     # ELBO is the sum of all these terms
     if math.isnan(kl_u_s) or math.isnan(kl_u_y):
         print(f"X_pred : {X_pred}")
@@ -338,9 +339,11 @@ def loss_function(config,
         print(f"X_recon_loss loss: {X_recon_loss}")
         print(f"Y_recon_loss loss: {Y_recon_loss}")
         exit()
-    elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + S_recon_loss + kl_u_y + kl_u_s            )
+    elbo = (Y_recon_loss + X_recon_loss + A_recon_loss + S_recon_loss + kl_u_y + kl_u_s
+            + hgr_term
+            )
 
-    return elbo, Y_recon_loss, X_recon_loss, A_recon_loss, S_recon_loss, kl_u_y, kl_u_s
+    return elbo, Y_recon_loss, X_recon_loss, A_recon_loss, S_recon_loss, kl_u_y, kl_u_s, hgr_term
 def recon_edge_loss(config, l, A, num_nodes):
     A = construct_A_from_edge_index(A, num_nodes)
     l_original = A.flatten().to(config.device)
