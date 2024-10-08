@@ -176,13 +176,13 @@ def train(loader, total_data):
                                                                                                           u_S, u_Y, train_idx)
             Y_pred = Y_pred.argmax(dim=1).unsqueeze(1)[train_idx]
             Y_prime = Y_classifier(X, edge_index)
-            Y_prime_loss = nn.MSELoss()(Y_pred[train_idx].float(), Y_prime[train_idx].float())
+            Y_prime_loss = nn.MSELoss()(Y_prime[train_idx].float(), Y_pred[train_idx].float())
             # S_hat = S_classifier(u_S, edge_index)
             # s_recon_loss = S_recon_loss(S_hat[S_idx], S_true)
             # S_pred = (S_hat > 0.5).float().cpu().numpy()
             S_pred  = S_hat.argmax(dim=1).unsqueeze(1).cpu().numpy()
             S_accuracy = accuracy_score(graph.s.float().cpu().numpy(), S_pred)
-            efl_term = -abs(config.efl_gamma * efl(S_logits[train_idx], Y_pred))
+            efl_term = -abs(config.efl_gamma * efl(S_logits[train_idx], Y_prime))
 
             loss = (elbo + efl_term
                     # + s_recon_loss
